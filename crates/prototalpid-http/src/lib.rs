@@ -5,6 +5,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub mod schemes;
+pub mod transport;
 pub mod wire;
 
 /// Returns the current UNIX timestamp in seconds.
