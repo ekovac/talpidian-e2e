@@ -4,7 +4,11 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub mod challenge;
+pub mod config;
 pub mod schemes;
+pub mod server;
+pub mod tls;
 pub mod transport;
 pub mod wire;
 
