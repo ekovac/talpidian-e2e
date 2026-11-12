@@ -15,7 +15,7 @@ Listed by their relative maturity level; less mature documents should be expecte
 * Mature (changes in non-normative wording or small normative details are likely, but broad strokes likely represent the final state)
   * [MOLE Architecture](https://moderation-of-unlinkable-endorsements.github.io/internet-drafts/draft-jms-mole-architecture.html)
   * [EC-IHAT (Endorsement/scarce-resource bootstrapping crypto protocol)](https://moderation-of-unlinkable-endorsements.github.io/internet-drafts/draft-ladd-mole-ec-ihat.html)
-  * [EC-ACT (Credential/client reputation crypto protocol)](https://moderation-of-unlinkable-endorsements.github.io/internet-drafts/draft-ladd-mole-ec-ihat.html)
+  * [EC-ACT (Credential/client reputation crypto protocol)](https://moderation-of-unlinkable-endorsements.github.io/internet-drafts/draft-schlesinger-mole-ec-act.html)
 * Active Development (discussion or validation of these components is ongoing and significant changes are likely)
   * [MOLE Protocols](https://moderation-of-unlinkable-endorsements.github.io/internet-drafts/draft-jms-mole-protocols.html)
   * [VOLE-IHAT (Candidate Endorsement/scarce-resource bootstrapping crypto protocol enabling federation via multi-presentation)](https://moderation-of-unlinkable-endorsements.github.io/internet-drafts/draft-authors-mole-vole-ihat.html)
