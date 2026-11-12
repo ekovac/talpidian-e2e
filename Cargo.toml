@@ -1,0 +1,54 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "Apache-2.0"
+repository = "https://github.com/ekovac/talpidian-e2e"
+
+[workspace.dependencies]
+ec-ihat = { git = "https://github.com/Moderation-of-unLinkable-Endorsements/mole-p256-rs" }
+ec-act = { git = "https://github.com/Moderation-of-unLinkable-Endorsements/mole-p256-rs" }
+
+prototalpid-http = { path = "crates/prototalpid-http" }
+prototalpid-anchor = { path = "crates/prototalpid-anchor" }
+prototalpid-moderator-proxy = { path = "crates/prototalpid-moderator-proxy" }
+prototalpid-cli = { path = "crates/prototalpid-cli" }
+
+anyhow = "1"
+axum = { version = "0.8", default-features = false, features = ["http1", "http2", "json", "tokio", "original-uri"] }
+base64 = "0.22"
+bytes = "1"
+chacha20poly1305 = { version = "0.10", features = ["std"] }
+clap = { version = "4", features = ["derive", "env"] }
+cookie = "0.18"
+getrandom = "0.4"
+hmac = "0.13"
+http = "1"
+http-auth = "0.1"
+hyper-util = { version = "0.1", features = ["full"] }
+mime = "0.3"
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "ring", "pem"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2", "json"] }
+rusqlite = "0.41"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-native-certs = "0.8"
+rustls-pki-types = { version = "1", features = ["std", "alloc"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_with = { version = "3", features = ["base64"] }
+sfv = "0.16"
+sha2 = "0.11"
+subtle = "2.6"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
+xdg = "3.0"
+zeroize = { version = "1.7", features = ["alloc"] }
