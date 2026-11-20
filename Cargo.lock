@@ -1666,6 +1666,7 @@ dependencies = [
  "cookie",
  "ec-act",
  "ec-ihat",
+ "guac",
  "http",
  "prototalpid-anchor",
  "prototalpid-http",

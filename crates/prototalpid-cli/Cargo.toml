@@ -29,6 +29,7 @@ zeroize.workspace = true
 
 [dev-dependencies]
 axum.workspace = true
+guac.workspace = true
 prototalpid-anchor.workspace = true
 prototalpid-moderator-proxy.workspace = true
 tempfile.workspace = true
