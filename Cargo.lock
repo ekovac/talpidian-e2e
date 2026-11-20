@@ -3,6 +3,19 @@
 version = 4
 
 [[package]]
+name = "act-rs"
+version = "0.1.0"
+source = "git+https://github.com/Moderation-of-unLinkable-Endorsements/act-rs?rev=f1bd64b90408677662bb9f96915d8dc0e58e1ad6#f1bd64b90408677662bb9f96915d8dc0e58e1ad6"
+dependencies = [
+ "getrandom 0.4.3",
+ "p256",
+ "sha2 0.11.0",
+ "shake",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
 name = "aead"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -756,6 +769,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "guac"
+version = "0.1.0"
+source = "git+https://github.com/cloudflareresearch/guac?rev=417757d24975a5a8a9048e4e540cc731ae945751#417757d24975a5a8a9048e4e540cc731ae945751"
+dependencies = [
+ "act-rs",
+ "base64 0.23.1",
+ "getrandom 0.4.3",
+ "hmac",
+ "http-auth",
+ "ihat-rs",
+ "sha2 0.11.0",
+ "thiserror",
+ "url",
+ "zeroize",
+]
+
+[[package]]
 name = "h2"
 version = "0.4.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1095,6 +1125,18 @@ checksum = "cb68373c0d6620ef8105e855e7745e18b0d00d3bdb07fb532e434244cdb9a714"
 dependencies = [
  "icu_normalizer",
  "icu_properties",
+]
+
+[[package]]
+name = "ihat-rs"
+version = "0.1.0"
+source = "git+https://github.com/Moderation-of-unLinkable-Endorsements/ihat-rs?rev=ed756147ac9a1cc530d718e749c0fae8090fda7c#ed756147ac9a1cc530d718e749c0fae8090fda7c"
+dependencies = [
+ "getrandom 0.4.3",
+ "p256",
+ "sha2 0.11.0",
+ "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -1650,6 +1692,7 @@ dependencies = [
  "ec-act",
  "ec-ihat",
  "getrandom 0.4.3",
+ "guac",
  "http",
  "http-auth",
  "hyper-util",

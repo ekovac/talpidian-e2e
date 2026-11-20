@@ -12,6 +12,7 @@ repository = "https://github.com/ekovac/talpidian-e2e"
 [workspace.dependencies]
 ec-ihat = { git = "https://github.com/Moderation-of-unLinkable-Endorsements/mole-p256-rs" }
 ec-act = { git = "https://github.com/Moderation-of-unLinkable-Endorsements/mole-p256-rs" }
+guac = { git = "https://github.com/cloudflareresearch/guac", rev = "417757d24975a5a8a9048e4e540cc731ae945751" }
 
 prototalpid-http = { path = "crates/prototalpid-http" }
 prototalpid-anchor = { path = "crates/prototalpid-anchor" }
