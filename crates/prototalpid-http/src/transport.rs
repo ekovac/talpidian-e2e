@@ -20,6 +20,7 @@ use sfv::{
 
 use crate::Error;
 use crate::schemes::{CredentialType, EndorsementType, parse_hex4_nonzero};
+use crate::wire::RedemptionChallenge;
 
 fn decode_b64(input: &str) -> Result<Vec<u8>, Error> {
     URL_SAFE_NO_PAD
@@ -85,7 +86,7 @@ pub enum MoleChallenge {
     Redeem {
         /// Endorsement protocol type.
         endorsement_type: EndorsementType,
-        /// Raw decoded `RedemptionChallenge` bytes (empty for `0001`).
+        /// Raw decoded 32-byte `RedemptionChallenge` octets (`draft-jms-mole-protocols` §4.1).
         challenge: Vec<u8>,
     },
     /// `challenge-T="<credential-challenge>"`
@@ -109,9 +110,9 @@ impl MoleChallenge {
                 endorsement_type,
                 challenge,
             } => {
-                if *endorsement_type == EndorsementType::NO_ENDORSEMENT && !challenge.is_empty() {
+                if challenge.len() != RedemptionChallenge::LENGTH {
                     return Err(Error::InvalidPayload(
-                        "NoEndorsement redeem-0001 challenge must be empty",
+                        "RedemptionChallenge in redeem-T must be 32 bytes",
                     ));
                 }
                 format_param("redeem-", endorsement_type.0, challenge)?
@@ -585,12 +586,13 @@ fn parse_mole_challenge_from_ref(raw: &ChallengeRef<'_>) -> Result<MoleChallenge
                     ));
                 }
                 let challenge = decode_b64(&val)?;
-                let et = EndorsementType(type_id);
-                if et == EndorsementType::NO_ENDORSEMENT && !challenge.is_empty() {
-                    return Err(Error::InvalidPayload("redeem-0001 challenge must be empty"));
+                if challenge.len() != RedemptionChallenge::LENGTH {
+                    return Err(Error::InvalidPayload(
+                        "RedemptionChallenge in redeem-T must be 32 bytes",
+                    ));
                 }
                 parsed = Some(MoleChallenge::Redeem {
-                    endorsement_type: et,
+                    endorsement_type: EndorsementType(type_id),
                     challenge,
                 });
             }

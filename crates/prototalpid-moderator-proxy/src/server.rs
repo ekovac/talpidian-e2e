@@ -389,20 +389,20 @@ fn challenge_401_response(
         .store
         .issue_redemption_challenge(&app.config.public_origin, &app.config.policy);
 
-    let mut challenges = vec![
-        MoleChallenge::Credential {
-            credential_type: CredentialType::EC_ACT,
-            challenge: act_chal.to_bytes().unwrap_or_default(),
-        },
-        MoleChallenge::Redeem {
+    let mut challenges = vec![MoleChallenge::Credential {
+        credential_type: CredentialType::EC_ACT,
+        challenge: act_chal.to_bytes().unwrap_or_default(),
+    }];
+    if app.store.has_anchor_sets() || !app.config.policy.allow_no_endorsement {
+        challenges.push(MoleChallenge::Redeem {
             endorsement_type: EndorsementType::EC_IHAT,
             challenge: red_chal.to_bytes().to_vec(),
-        },
-    ];
+        });
+    }
     if app.config.policy.allow_no_endorsement {
         challenges.push(MoleChallenge::Redeem {
             endorsement_type: EndorsementType::NO_ENDORSEMENT,
-            challenge: Vec::new(),
+            challenge: red_chal.to_bytes().to_vec(),
         });
     }
 

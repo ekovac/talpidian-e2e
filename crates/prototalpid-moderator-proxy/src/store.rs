@@ -305,6 +305,11 @@ impl ModeratorStore {
         })
     }
 
+    /// Returns whether at least one trusted EC-IHAT Anchor Set is configured.
+    pub fn has_anchor_sets(&self) -> bool {
+        !self.anchor_sets.is_empty()
+    }
+
     /// Builds the JSON [`ModeratorConfiguration`] published at `/.well-known/mole-moderator`.
     pub fn build_configuration(
         &self,

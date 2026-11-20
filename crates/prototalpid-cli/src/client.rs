@@ -757,8 +757,8 @@ impl MoleClient {
                 c,
                 MoleChallenge::Redeem {
                     endorsement_type: EndorsementType::NO_ENDORSEMENT,
-                    ..
-                }
+                    challenge,
+                } if RedemptionChallenge::from_bytes(challenge).is_ok()
             )
         }) && sup_endorsements
             .iter()

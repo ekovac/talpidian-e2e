@@ -123,6 +123,17 @@ fn www_authenticate_multi_challenge_and_strict_validation() {
     );
 
     // Strict single-challenge checks:
+    let redeem_no_end = MoleChallenge::Redeem {
+        endorsement_type: EndorsementType::NO_ENDORSEMENT,
+        challenge: [0x11u8; 32].to_vec(),
+    };
+    let redeem_no_end_hdr = redeem_no_end.to_header_value().unwrap();
+    assert_eq!(
+        parse_single_mole_challenge_strict(&redeem_no_end_hdr).unwrap(),
+        redeem_no_end
+    );
+    assert!(parse_single_mole_challenge_strict("Mole redeem-0001=\"\"").is_err());
+    assert!(parse_single_mole_challenge_strict("Mole redeem-0002=\"AA\"").is_err());
     assert!(parse_single_mole_challenge_strict("Mole ENDORSE-0002=\"\"").is_ok());
     assert!(parse_single_mole_challenge_strict("Mole challenge-0000=\"AA\"").is_err());
     assert!(parse_single_mole_challenge_strict("Mole challenge-001=\"AA\"").is_err());
