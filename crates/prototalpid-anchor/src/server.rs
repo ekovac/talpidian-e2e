@@ -17,9 +17,7 @@ use rustls::ServerConfig;
 use prototalpid_http::challenge::{AnchorChallengeSubmission, DEFAULT_ANCHOR_CHALLENGE_PATH};
 use prototalpid_http::config::{AnchorConfiguration, WELL_KNOWN_MOLE_ANCHOR};
 use prototalpid_http::schemes::{CIPHERSUITE_P256_SHA256, EndorsementType};
-use prototalpid_http::server::{
-    SpawnedHttpsServer, json_error, json_no_store, spawn_https_router,
-};
+use prototalpid_http::server::{SpawnedHttpsServer, json_error, json_no_store, spawn_https_router};
 use prototalpid_http::transport::{
     MoleChallenge, apply_expose_auth_headers, format_endorsement_response_content_type,
     has_want_endorsement_mole, parse_endorsement_request_content_type,
@@ -29,7 +27,7 @@ use prototalpid_http::wire::EcIhatGrantPost;
 use crate::store::{AnchorStore, ChallengeMode, StoreError};
 
 /// Cookie name storing Anchor trust-session tokens.
-pub const ANCHOR_SESSION_COOKIE: &str = "anchor_session";
+pub const ANCHOR_SESSION_COOKIE: &str = "__Host-anchor_session";
 
 /// Grant endpoint path served by `prototalpid-anchor`.
 pub const ANCHOR_GRANT_PATH: &str = "/mole/grant";
@@ -114,6 +112,19 @@ pub async fn spawn_anchor_server(
     mut config: AnchorRuntimeConfig,
     public_origin_override: Option<String>,
 ) -> anyhow::Result<RunningAnchorServer> {
+    anyhow::ensure!(config.pow_bits <= 32, "pow_bits must be in 0..=32");
+    anyhow::ensure!(
+        config.quota_per_challenge > 0 && config.max_quota_per_session > 0,
+        "Anchor quota values must be greater than zero"
+    );
+    anyhow::ensure!(
+        config.max_batch_size > 0,
+        "max_batch_size must be greater than zero"
+    );
+    anyhow::ensure!(
+        config.challenge_ttl_secs > 0 && config.session_ttl_secs > 0 && config.grant_ttl_secs > 0,
+        "Anchor TTL values must be greater than zero"
+    );
     let public_key = store.public_key().clone();
     let store_for_router = store.clone();
     let inner = spawn_https_router(listen_addr, tls_config, public_origin_override, |origin| {
@@ -180,7 +191,10 @@ async fn handle_get_challenge(State(app): State<Arc<AnchorApp>>, headers: Header
         app.config.pow_bits,
         app.config.challenge_ttl_secs,
     ) else {
-        return json_error(StatusCode::INTERNAL_SERVER_ERROR, "challenge creation error");
+        return json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "challenge creation error",
+        );
     };
     let mut resp = json_no_store(StatusCode::OK, &offer);
     if has_want_endorsement_mole(&headers) && quota > 0 {
@@ -195,7 +209,10 @@ async fn handle_post_challenge(
     body: Bytes,
 ) -> Response {
     let Ok(submission) = serde_json::from_slice::<AnchorChallengeSubmission>(&body) else {
-        return json_error(StatusCode::BAD_REQUEST, "malformed challenge submission JSON");
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "malformed challenge submission JSON",
+        );
     };
     let existing_cookie = extract_cookie(&headers, ANCHOR_SESSION_COOKIE);
 
@@ -225,9 +242,10 @@ async fn handle_post_challenge(
             }
             resp
         }
-        Err(StoreError::QuotaExhausted) => {
-            json_error(StatusCode::TOO_MANY_REQUESTS, "endorsement session quota exhausted")
-        }
+        Err(StoreError::QuotaExhausted) => json_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "endorsement session quota exhausted",
+        ),
         Err(StoreError::ChallengeFailed) => {
             json_error(StatusCode::FORBIDDEN, "challenge verification failed")
         }
@@ -270,7 +288,10 @@ async fn handle_post_grant(
             ) {
                 Ok(commitments) => commitments.to_bytes(),
                 Err(StoreError::Unauthorized) => {
-                    return json_error(StatusCode::UNAUTHORIZED, "invalid or expired anchor_session");
+                    return json_error(
+                        StatusCode::UNAUTHORIZED,
+                        "invalid or expired anchor_session",
+                    );
                 }
                 Err(StoreError::QuotaExhausted) => {
                     return json_error(
@@ -294,7 +315,10 @@ async fn handle_post_grant(
     match encoded {
         Ok(bytes) => (
             StatusCode::OK,
-            [(CONTENT_TYPE, resp_ct.as_str()), (CACHE_CONTROL, "no-store")],
+            [
+                (CONTENT_TYPE, resp_ct.as_str()),
+                (CACHE_CONTROL, "no-store"),
+            ],
             bytes,
         )
             .into_response(),
@@ -322,12 +346,37 @@ fn attach_endorse_header(headers: &mut HeaderMap) {
 }
 
 fn extract_cookie(headers: &HeaderMap, target_name: &str) -> Option<String> {
-    headers
+    let mut matches = headers
         .get_all(COOKIE)
         .iter()
         .filter_map(|v| v.to_str().ok())
         .flat_map(Cookie::split_parse)
         .filter_map(Result::ok)
-        .find(|c| c.name() == target_name && !c.value().is_empty())
-        .map(|c| c.value().to_owned())
+        .filter(|c| c.name() == target_name && !c.value().is_empty());
+    let value = matches.next()?.value().to_owned();
+    matches.next().is_none().then_some(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn duplicate_anchor_session_cookies_are_rejected() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            COOKIE,
+            HeaderValue::from_static("__Host-anchor_session=first"),
+        );
+        assert_eq!(
+            extract_cookie(&headers, ANCHOR_SESSION_COOKIE).as_deref(),
+            Some("first"),
+        );
+
+        headers.append(
+            COOKIE,
+            HeaderValue::from_static("__Host-anchor_session=second"),
+        );
+        assert!(extract_cookie(&headers, ANCHOR_SESSION_COOKIE).is_none());
+    }
 }

@@ -7,7 +7,7 @@ pub mod store;
 
 pub use server::{
     MODERATOR_ISSUE_PATH, ModeratorProxyApp, ModeratorProxyConfig, RunningModeratorProxy,
-    spawn_moderator_proxy,
+    compute_request_binding, spawn_moderator_proxy,
 };
 pub use store::{
     ModerationPolicy, ModeratorError, ModeratorStore, PresentationVerdict, SessionVerdict,

@@ -21,8 +21,7 @@ use prototalpid_http::tls::LocalCa;
 use prototalpid_http::transport::{MOLE_SESSION_HEADER, MoleAuthorization};
 use prototalpid_http::wire::{EcActChallenge, EcActPresentationAndUpdate};
 use prototalpid_moderator_proxy::{
-    ModerationPolicy, ModeratorProxyConfig, ModeratorStore, TrustedAnchorSet,
-    spawn_moderator_proxy,
+    ModerationPolicy, ModeratorProxyConfig, ModeratorStore, TrustedAnchorSet, spawn_moderator_proxy,
 };
 
 fn cli_bin() -> &'static str {
@@ -34,7 +33,9 @@ async fn spawn_test_origin(hits: Arc<AtomicUsize>) -> (Url, tokio::task::JoinHan
     let addr = listener.local_addr().unwrap();
     let router = Router::new()
         .fallback(
-            |State(hits): State<Arc<AtomicUsize>>, OriginalUri(uri): OriginalUri, headers: HeaderMap| async move {
+            |State(hits): State<Arc<AtomicUsize>>,
+             OriginalUri(uri): OriginalUri,
+             headers: HeaderMap| async move {
                 assert!(
                     headers.get(&MOLE_SESSION_HEADER).is_none(),
                     "Mole-Session leaked to upstream"
@@ -107,7 +108,10 @@ async fn cli_permissions_cookies_session_reuse_signoff_and_expiry_recovery() {
     )
     .await
     .unwrap();
-    let anchor_url = format!("https://localhost:{}/challenge", anchor_srv.local_addr.port());
+    let anchor_url = format!(
+        "https://localhost:{}/challenge",
+        anchor_srv.local_addr.port()
+    );
 
     let prompt_leaf = ca.issue_server_cert(&[]).unwrap();
     let prompt_store = Arc::new(AnchorStore::open(None, &ctx_iss).unwrap());
@@ -200,13 +204,19 @@ async fn cli_permissions_cookies_session_reuse_signoff_and_expiry_recovery() {
 
     // Verify 0600 permissions on SQLite wallet file and 0700 on parent dir!
     let db_mode = std::fs::metadata(&store_path).unwrap().permissions().mode() & 0o777;
-    assert_eq!(db_mode, 0o600, "wallet SQLite file must have 0600 permissions");
+    assert_eq!(
+        db_mode, 0o600,
+        "wallet SQLite file must have 0600 permissions"
+    );
     let dir_mode = std::fs::metadata(store_path.parent().unwrap())
         .unwrap()
         .permissions()
         .mode()
         & 0o777;
-    assert_eq!(dir_mode, 0o700, "wallet directory must have 0700 permissions");
+    assert_eq!(
+        dir_mode, 0o700,
+        "wallet directory must have 0700 permissions"
+    );
     assert!(
         std::fs::read_to_string(&cookie_jar_path)
             .unwrap()
@@ -247,7 +257,11 @@ async fn cli_permissions_cookies_session_reuse_signoff_and_expiry_recovery() {
         .arg(format!("{mod_origin}/articles/1"))
         .output()
         .unwrap();
-    assert!(r1.status.success(), "stderr: {}", String::from_utf8_lossy(&r1.stderr));
+    assert!(
+        r1.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&r1.stderr)
+    );
     let r1_stdout = String::from_utf8(r1.stdout).unwrap();
     assert!(r1_stdout.contains("ok:/articles/1:hit=1"));
     assert!(r1_stdout.contains("HTTP=200"));
@@ -274,7 +288,10 @@ async fn cli_permissions_cookies_session_reuse_signoff_and_expiry_recovery() {
         .output()
         .unwrap();
     assert!(r2.status.success());
-    assert_eq!(String::from_utf8(r2.stdout).unwrap(), "ok:/articles/2:hit=2");
+    assert_eq!(
+        String::from_utf8(r2.stdout).unwrap(),
+        "ok:/articles/2:hit=2"
+    );
     assert_eq!(upstream_hits.load(Ordering::SeqCst), 2);
 
     // 4. Explicit `--mole-signoff` refunds full deposit (`40 + 20 = 60` credits)!
@@ -287,13 +304,20 @@ async fn cli_permissions_cookies_session_reuse_signoff_and_expiry_recovery() {
         .arg(&mod_origin)
         .output()
         .unwrap();
-    assert!(so.status.success(), "stderr: {}", String::from_utf8_lossy(&so.stderr));
+    assert!(
+        so.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&so.stderr)
+    );
 
     let st2 = read_status_json(&store_path, &cacert_path);
     assert_eq!(total_endorsements(&st2), 1, "still 1 endorsement left");
     assert!(st2.pending_spends.is_empty());
     assert_eq!(st2.credentials.len(), 1);
-    assert_eq!(st2.credentials[0].balance, 60, "polite signoff refunded full deposit");
+    assert_eq!(
+        st2.credentials[0].balance, 60,
+        "polite signoff refunded full deposit"
+    );
     assert_eq!(st2.credentials[0].presentations_count, 1);
 
     // 5. `--mole-signoff-on-exit` opens a new session with the refunded credential and settles on exit!
@@ -309,7 +333,10 @@ async fn cli_permissions_cookies_session_reuse_signoff_and_expiry_recovery() {
         .output()
         .unwrap();
     assert!(r3.status.success());
-    assert_eq!(String::from_utf8(r3.stdout).unwrap(), "ok:/articles/3:hit=3");
+    assert_eq!(
+        String::from_utf8(r3.stdout).unwrap(),
+        "ok:/articles/3:hit=3"
+    );
 
     let st3 = read_status_json(&store_path, &cacert_path);
     assert_eq!(total_endorsements(&st3), 1, "still 1 endorsement left");
@@ -330,7 +357,10 @@ async fn cli_permissions_cookies_session_reuse_signoff_and_expiry_recovery() {
         .output()
         .unwrap();
     assert!(r4.status.success());
-    assert_eq!(String::from_utf8(r4.stdout).unwrap(), "ok:/articles/4:hit=4");
+    assert_eq!(
+        String::from_utf8(r4.stdout).unwrap(),
+        "ok:/articles/4:hit=4"
+    );
 
     // Wait for the 3-second hold to expire and finalize on the Moderator
     tokio::time::sleep(Duration::from_millis(3400)).await;
@@ -346,12 +376,26 @@ async fn cli_permissions_cookies_session_reuse_signoff_and_expiry_recovery() {
         .arg(format!("{mod_origin}/articles/5"))
         .output()
         .unwrap();
-    assert!(r5.status.success(), "stderr: {}", String::from_utf8_lossy(&r5.stderr));
-    assert_eq!(String::from_utf8(r5.stdout).unwrap(), "ok:/articles/5:hit=5");
+    assert!(
+        r5.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&r5.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(r5.stdout).unwrap(),
+        "ok:/articles/5:hit=5"
+    );
 
     let st4 = read_status_json(&store_path, &cacert_path);
-    assert_eq!(total_endorsements(&st4), 1, "never needed a 2nd endorsement!");
-    assert_eq!(st4.credentials[0].balance, 60, "expiry recovery + signoff preserved full balance");
+    assert_eq!(
+        total_endorsements(&st4),
+        1,
+        "never needed a 2nd endorsement!"
+    );
+    assert_eq!(
+        st4.credentials[0].balance, 60,
+        "expiry recovery + signoff preserved full balance"
+    );
     assert_eq!(st4.credentials[0].presentations_count, 4);
 
     // 7. Simulate an interrupted `in_flight` presentation (client wrote `in_flight` state and
@@ -373,17 +417,19 @@ async fn cli_permissions_cookies_session_reuse_signoff_and_expiry_recovery() {
             .unwrap()
             .unwrap();
 
-        let probe_client = MoleClient::new(
-            Arc::new(WalletStore::open(None).unwrap()),
-            {
-                let mut o = MoleClientOptions::new(ca.http_client().unwrap());
-                o.mole_disabled = true;
-                o
-            },
-        );
+        let probe_client = MoleClient::new(Arc::new(WalletStore::open(None).unwrap()), {
+            let mut o = MoleClientOptions::new(ca.http_client().unwrap());
+            o.mole_disabled = true;
+            o
+        });
         let target_url = Url::parse(&format!("{mod_origin}/articles/crash")).unwrap();
         let resp_401 = probe_client
-            .execute_request(Method::GET, target_url.clone(), Default::default(), Bytes::new())
+            .execute_request(
+                Method::GET,
+                target_url.clone(),
+                Default::default(),
+                Bytes::new(),
+            )
             .await
             .unwrap();
         assert_eq!(resp_401.status, StatusCode::UNAUTHORIZED);
@@ -434,20 +480,23 @@ async fn cli_permissions_cookies_session_reuse_signoff_and_expiry_recovery() {
             )
             .unwrap();
 
-        let _ = mod_store
-            .process_presentation(
-                &mod_origin,
-                "GET",
-                "/articles/crash",
-                &policy,
-                CredentialType::EC_ACT,
-                &pres_bytes,
-            )
+        let mut presentation_headers = HeaderMap::new();
+        presentation_headers.insert(
+            AUTHORIZATION,
+            MoleAuthorization::Presentation {
+                credential_type: CredentialType::EC_ACT,
+                presentation: pres_bytes,
+            }
+            .to_header_value()
+            .unwrap()
+            .parse()
+            .unwrap(),
+        );
+        let accepted_but_lost = probe_client
+            .execute_request(Method::GET, target_url, presentation_headers, Bytes::new())
+            .await
             .unwrap();
-        let _ = MoleAuthorization::Signoff {
-            credential_type: CredentialType::EC_ACT,
-            recovery_handle: handle.to_bytes().to_vec(),
-        };
+        assert_eq!(accepted_but_lost.status, StatusCode::OK);
     }
 
     let st_crash = read_status_json(&store_path, &cacert_path);
@@ -465,10 +514,14 @@ async fn cli_permissions_cookies_session_reuse_signoff_and_expiry_recovery() {
         .arg(format!("{mod_origin}/articles/recovered"))
         .output()
         .unwrap();
-    assert!(r6.status.success(), "stderr: {}", String::from_utf8_lossy(&r6.stderr));
+    assert!(
+        r6.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&r6.stderr)
+    );
     assert_eq!(
         String::from_utf8(r6.stdout).unwrap(),
-        "ok:/articles/recovered:hit=6"
+        "ok:/articles/recovered:hit=7"
     );
 
     let st_final = read_status_json(&store_path, &cacert_path);

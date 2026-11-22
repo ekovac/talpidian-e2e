@@ -5,7 +5,7 @@ use std::time::Duration;
 use axum::Router;
 use axum::extract::State;
 use ec_ihat::{Backend as _, DefaultBackend as IhatBackend};
-use http::header::{AUTHORIZATION, CACHE_CONTROL};
+use http::header::{AUTHORIZATION, CACHE_CONTROL, COOKIE};
 use http::{HeaderMap, StatusCode};
 use tokio::net::TcpListener;
 use url::Url;
@@ -24,8 +24,8 @@ use prototalpid_http::wire::{
     EcActUpdate, RedemptionChallenge,
 };
 use prototalpid_moderator_proxy::{
-    MODERATOR_ISSUE_PATH, ModerationPolicy, ModeratorProxyConfig, ModeratorStore,
-    TrustedAnchorSet, spawn_moderator_proxy,
+    MODERATOR_ISSUE_PATH, ModerationPolicy, ModeratorProxyConfig, ModeratorStore, TrustedAnchorSet,
+    spawn_moderator_proxy,
 };
 
 async fn spawn_mock_upstream(hits: Arc<AtomicUsize>) -> (Url, tokio::task::JoinHandle<()>) {
@@ -119,7 +119,15 @@ async fn moderator_proxy_held_session_signoff_flood_penalty_and_recovery() {
     let issue_url = format!("{origin}{MODERATOR_ISSUE_PATH}");
 
     // 1. Unauthenticated request -> 401 with challenge-0001 and redeem-0002; zero upstream hits.
-    let resp_401 = client.get(format!("{origin}/articles/1")).send().await.unwrap();
+    let protected_body = "operation=safe";
+    let protected_cookie = "account=alice";
+    let resp_401 = client
+        .post(format!("{origin}/articles/1"))
+        .header(COOKIE, protected_cookie)
+        .body(protected_body)
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp_401.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(upstream_hits.load(Ordering::SeqCst), 0);
 
@@ -154,13 +162,19 @@ async fn moderator_proxy_held_session_signoff_flood_penalty_and_recovery() {
     .to_header_value()
     .unwrap();
     let resp_grease = client
-        .get(format!("{origin}/articles/1"))
+        .post(format!("{origin}/articles/1"))
+        .header(COOKIE, protected_cookie)
         .header(AUTHORIZATION, grease_auth)
+        .body(protected_body)
         .send()
         .await
         .unwrap();
     assert_eq!(resp_grease.status(), StatusCode::UNAUTHORIZED);
-    assert!(MoleCredentialHeader::from_headers(resp_grease.headers()).unwrap().is_none());
+    assert!(
+        MoleCredentialHeader::from_headers(resp_grease.headers())
+            .unwrap()
+            .is_none()
+    );
     assert_eq!(upstream_hits.load(Ordering::SeqCst), 0);
 
     // 3. Fetch /.well-known/mole-moderator & run RedeemAndIssue using Anchor #2 endorsement.
@@ -211,8 +225,9 @@ async fn moderator_proxy_held_session_signoff_flood_penalty_and_recovery() {
         .unwrap();
     assert_eq!(resp_iss.status(), StatusCode::OK);
     assert_eq!(resp_iss.headers().get(CACHE_CONTROL).unwrap(), "no-store");
-    let Some(MoleCredentialHeader::Response { response: resp_raw, .. }) =
-        MoleCredentialHeader::from_headers(resp_iss.headers()).unwrap()
+    let Some(MoleCredentialHeader::Response {
+        response: resp_raw, ..
+    }) = MoleCredentialHeader::from_headers(resp_iss.headers()).unwrap()
     else {
         panic!("expected Mole-Credential: response-0001");
     };
@@ -260,9 +275,33 @@ async fn moderator_proxy_held_session_signoff_flood_penalty_and_recovery() {
     .to_header_value()
     .unwrap();
 
-    let resp_p1 = client
-        .get(format!("{origin}/articles/1"))
+    let resp_wrong_body = client
+        .post(format!("{origin}/articles/1"))
+        .header(COOKIE, protected_cookie)
         .header(AUTHORIZATION, &pres1_auth)
+        .body("operation=evil")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp_wrong_body.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(upstream_hits.load(Ordering::SeqCst), 0);
+
+    let resp_wrong_cookie = client
+        .post(format!("{origin}/articles/1"))
+        .header(COOKIE, "account=mallory")
+        .header(AUTHORIZATION, &pres1_auth)
+        .body(protected_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp_wrong_cookie.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(upstream_hits.load(Ordering::SeqCst), 0);
+
+    let resp_p1 = client
+        .post(format!("{origin}/articles/1"))
+        .header(COOKIE, protected_cookie)
+        .header(AUTHORIZATION, &pres1_auth)
+        .body(protected_body)
         .send()
         .await
         .unwrap();

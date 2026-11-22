@@ -3,6 +3,7 @@
 
 #![allow(clippy::type_complexity)]
 
+use std::fs::{self, OpenOptions};
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -35,6 +36,9 @@ pub enum ChallengeMode {
 /// Errors produced by [`AnchorStore`].
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
+    /// Filesystem error while creating or protecting the database.
+    #[error("filesystem error: {0}")]
+    Io(#[from] std::io::Error),
     /// SQLite error.
     #[error("database error: {0}")]
     Db(#[from] rusqlite::Error),
@@ -77,7 +81,7 @@ impl AnchorStore {
     /// Opens or initializes an `AnchorStore` at `db_path` (or `:memory:` if `None`).
     pub fn open(db_path: Option<&Path>, default_epoch: &[u8]) -> Result<Self, StoreError> {
         let conn = match db_path {
-            Some(path) => Connection::open(path)?,
+            Some(path) => open_private_database(path)?,
             None => Connection::open_in_memory()?,
         };
         conn.execute_batch(
@@ -475,7 +479,9 @@ impl AnchorStore {
                 return Err(StoreError::BadGrant("unknown grant session_id"));
             };
             if consumed != 0 || expires_at <= now {
-                return Err(StoreError::BadGrant("grant session already consumed or expired"));
+                return Err(StoreError::BadGrant(
+                    "grant session already consumed or expired",
+                ));
             }
             let (Some(nonce_vec), Some(ct_vec)) = (nonce_opt, ct_opt) else {
                 return Err(StoreError::BadGrant("missing AnchorState ciphertext"));
@@ -552,6 +558,23 @@ impl AnchorStore {
     }
 }
 
+fn open_private_database(path: &Path) -> Result<Connection, StoreError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(path)?;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(Connection::open(path)?)
+}
+
 fn random_bytes<const N: usize>() -> Result<[u8; N], StoreError> {
     let mut out = [0u8; N];
     getrandom::fill(&mut out).map_err(|_| StoreError::Crypto("entropy failure"))?;
@@ -597,7 +620,29 @@ fn deserialize_anchor_states(bytes: &[u8]) -> Result<Vec<ec_ihat::AnchorState>, 
         );
     }
     if !rest.is_empty() {
-        return Err(StoreError::Crypto("trailing bytes in stored AnchorState batch"));
+        return Err(StoreError::Crypto(
+            "trailing bytes in stored AnchorState batch",
+        ));
     }
     Ok(out)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn persistent_database_permissions_are_private() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("anchor.db");
+        fs::write(&path, []).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let _store = AnchorStore::open(Some(&path), b"epoch").unwrap();
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
 }

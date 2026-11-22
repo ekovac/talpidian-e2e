@@ -10,8 +10,11 @@ use std::io::{self, Write};
 use std::sync::Arc;
 
 use anyhow::{Context, bail};
-use bytes::Bytes;
-use http::header::{AUTHORIZATION, CONTENT_TYPE, COOKIE, HeaderMap, HeaderValue, LOCATION, SET_COOKIE};
+use bytes::{Bytes, BytesMut};
+use http::header::{
+    AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, HOST, HeaderMap, HeaderValue, LOCATION,
+    PROXY_AUTHORIZATION, SET_COOKIE, TRANSFER_ENCODING,
+};
 use http::{Method, StatusCode};
 use url::{Position, Url};
 
@@ -24,8 +27,8 @@ use prototalpid_http::config::{
 };
 use prototalpid_http::schemes::{CredentialType, EC_IHAT_CTX_RED, EndorsementType};
 use prototalpid_http::transport::{
-    MOLE_SESSION_HEADER, MoleAuthorization, MoleChallenge, MoleCredentialHeader,
-    WANT_ENDORSEMENT_HEADER, format_endorsement_request_content_type,
+    MOLE_CREDENTIAL_HEADER, MOLE_SESSION_HEADER, MoleAuthorization, MoleChallenge,
+    MoleCredentialHeader, WANT_ENDORSEMENT_HEADER, format_endorsement_request_content_type,
     parse_endorsement_response_content_type, parse_mole_session, parse_www_authenticate_headers,
 };
 use prototalpid_http::unix_now;
@@ -35,6 +38,8 @@ use prototalpid_http::wire::{
 };
 
 use crate::store::{PendingSpendRecord, WalletStore};
+
+const MAX_RESPONSE_BODY_BYTES: usize = 64 * 1024 * 1024;
 
 /// Options controlling a [`MoleClient`] instance.
 #[derive(Clone)]
@@ -140,8 +145,8 @@ impl MoleClient {
                 wk_resp.status
             );
         }
-        let anchor_cfg: AnchorConfiguration = serde_json::from_slice(&wk_resp.body)
-            .context("invalid AnchorConfiguration JSON")?;
+        let anchor_cfg: AnchorConfiguration =
+            serde_json::from_slice(&wk_resp.body).context("invalid AnchorConfiguration JSON")?;
         let (grant_url, pk_a) = anchor_cfg.validate_ec_ihat()?;
         self.store.save_anchor_config(&anchor_origin, &anchor_cfg)?;
 
@@ -269,8 +274,9 @@ impl MoleClient {
             .into_iter()
             .zip(&grant_responses.responses)
             .map(|(st, resp)| {
-                ec_ihat::finalize(&pk_a, st, resp)
-                    .map_err(|e| anyhow::anyhow!("ec_ihat::finalize failed (discarding batch): {e}"))
+                ec_ihat::finalize(&pk_a, st, resp).map_err(|e| {
+                    anyhow::anyhow!("ec_ihat::finalize failed (discarding batch): {e}")
+                })
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
 
@@ -390,7 +396,10 @@ impl MoleClient {
         };
 
         let mut headers = HeaderMap::new();
-        headers.insert(AUTHORIZATION, HeaderValue::from_str(&auth.to_header_value()?)?);
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&auth.to_header_value()?)?,
+        );
         self.vlog(format!(
             "MOLE: sending {label}-0001 to {}",
             pending.issuance_uri
@@ -416,7 +425,8 @@ impl MoleClient {
                 "MOLE: signoff returned 404 for {}; discarding expired spend state",
                 pending.moderator_origin
             ));
-            self.store.discard_pending_spend(&pending.moderator_origin)?;
+            self.store
+                .discard_pending_spend(&pending.moderator_origin)?;
         }
         Ok(false)
     }
@@ -438,10 +448,14 @@ impl MoleClient {
         let mut url = initial_url;
         let mut body = initial_body;
         let mut redirects = 0usize;
+        let initial_origin = url.origin();
+        let mut redirect_cleared_body = false;
 
         loop {
+            let same_origin = url.origin() == initial_origin;
+            let hop_headers = redirect_headers(&user_headers, same_origin, redirect_cleared_body);
             let resp = self
-                .execute_single_hop(&method, &url, &user_headers, &body)
+                .execute_single_hop(&method, &url, &hop_headers, &body, same_origin)
                 .await?;
 
             if self.opts.follow_redirects
@@ -452,15 +466,19 @@ impl MoleClient {
                 if redirects >= self.opts.max_redirects {
                     bail!("maximum redirects ({}) exceeded", self.opts.max_redirects);
                 }
-                url = url.join(loc_str)?;
-                if matches!(
-                    resp.status,
-                    StatusCode::SEE_OTHER | StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND
-                ) && method == Method::POST
-                {
+                let next_url = url.join(loc_str)?;
+                let rewrite_to_get = (resp.status == StatusCode::SEE_OTHER
+                    && method != Method::HEAD)
+                    || (matches!(
+                        resp.status,
+                        StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND
+                    ) && method == Method::POST);
+                if rewrite_to_get {
                     method = Method::GET;
                     body = Bytes::new();
+                    redirect_cleared_body = true;
                 }
+                url = next_url;
                 redirects += 1;
                 continue;
             }
@@ -475,10 +493,13 @@ impl MoleClient {
         url: &Url,
         user_headers: &HeaderMap,
         body: &Bytes,
+        include_explicit_cookie: bool,
     ) -> anyhow::Result<HttpResponseData> {
         if self.opts.mole_disabled || url.scheme() != "https" {
+            let headers =
+                self.headers_with_cookies(url, user_headers.clone(), include_explicit_cookie)?;
             return self
-                .raw_send(method, url, user_headers.clone(), body.clone(), true)
+                .raw_send(method, url, headers, body.clone(), false)
                 .await;
         }
 
@@ -519,15 +540,19 @@ impl MoleClient {
             }
         }
 
-        // Step 2: Send initial request (attaching Mole-Session if active).
-        let mut req_headers = user_headers.clone();
+        // Step 2: Freeze the end-to-end request headers for the challenge/presentation pair.
+        // In particular, discovery or issuance responses between the two attempts must not
+        // change the Cookie field that the Moderator bound into the challenge.
+        let base_headers =
+            self.headers_with_cookies(url, user_headers.clone(), include_explicit_cookie)?;
+        let mut req_headers = base_headers.clone();
         if let Some(ref tok) = attached_session_token {
             self.vlog("MOLE: attaching active Mole-Session header");
             req_headers.insert(MOLE_SESSION_HEADER, HeaderValue::from_str(tok)?);
         }
 
         let initial_resp = self
-            .raw_send(method, url, req_headers, body.clone(), true)
+            .raw_send(method, url, req_headers, body.clone(), false)
             .await?;
 
         self.process_response_mole_credential(&moderator_origin, &initial_resp.headers)?;
@@ -565,7 +590,7 @@ impl MoleClient {
         let act_chal = EcActChallenge::from_bytes(&act_chal_raw)?;
 
         let mod_cfg = self
-            .ensure_moderator_config(url, &moderator_origin, &act_chal)
+            .ensure_moderator_config(url, &moderator_origin, &act_chal, include_explicit_cookie)
             .await?;
         let (issuance_url, sup_endorsements, sup_keys) = mod_cfg.parse_supported()?;
         let Some(active_key) = sup_keys
@@ -657,7 +682,7 @@ impl MoleClient {
         })
         .to_header_value()?;
 
-        let mut retry_headers = user_headers.clone();
+        let mut retry_headers = base_headers;
         retry_headers.insert(AUTHORIZATION, HeaderValue::from_str(&auth_val)?);
         self.vlog(format!(
             "MOLE: presenting EC-ACT Credential (escrowing s={} credits)",
@@ -665,7 +690,7 @@ impl MoleClient {
         ));
 
         let retry_resp = self
-            .raw_send(method, url, retry_headers, body.clone(), true)
+            .raw_send(method, url, retry_headers, body.clone(), false)
             .await?;
 
         self.process_response_mole_credential(&moderator_origin, &retry_resp.headers)?;
@@ -689,8 +714,8 @@ impl MoleClient {
                 self.store
                     .mark_spend_held(moderator_origin, sess_tok.as_deref(), duration_secs)?;
                 self.vlog(format!(
-                    "MOLE: credential held-for-update for {duration_secs}s (Mole-Session: {:?})",
-                    sess_tok
+                    "MOLE: credential held-for-update for {duration_secs}s (Mole-Session received: {})",
+                    sess_tok.is_some()
                 ));
             }
             MoleCredentialHeader::Update {
@@ -715,6 +740,7 @@ impl MoleClient {
         target_url: &Url,
         moderator_origin: &str,
         act_chal: &EcActChallenge,
+        include_explicit_cookie: bool,
     ) -> anyhow::Result<ModeratorConfiguration> {
         if let Some(cached) = self.store.load_moderator_config(moderator_origin)?
             && let Ok((_, _, keys)) = cached.parse_supported()
@@ -727,8 +753,10 @@ impl MoleClient {
 
         let wk_url = moderator_well_known_url(target_url)?;
         self.vlog(format!("MOLE: fetching Moderator config from {wk_url}"));
+        let headers =
+            self.headers_with_cookies(&wk_url, HeaderMap::new(), include_explicit_cookie)?;
         let resp = self
-            .raw_send(&Method::GET, &wk_url, HeaderMap::new(), Bytes::new(), true)
+            .raw_send(&Method::GET, &wk_url, headers, Bytes::new(), false)
             .await?;
         if !resp.status.is_success() {
             bail!(
@@ -736,8 +764,8 @@ impl MoleClient {
                 resp.status
             );
         }
-        let cfg: ModeratorConfiguration = serde_json::from_slice(&resp.body)
-            .context("invalid ModeratorConfiguration JSON")?;
+        let cfg: ModeratorConfiguration =
+            serde_json::from_slice(&resp.body).context("invalid ModeratorConfiguration JSON")?;
         self.store.save_moderator_config(moderator_origin, &cfg)?;
         Ok(cfg)
     }
@@ -880,12 +908,8 @@ impl MoleClient {
         body: Bytes,
         include_cookies: bool,
     ) -> anyhow::Result<HttpResponseData> {
-        if include_cookies && !headers.contains_key(COOKIE) {
-            if let Some(ref explicit) = self.opts.explicit_cookie_header {
-                headers.insert(COOKIE, HeaderValue::from_str(explicit)?);
-            } else if let Some(stored_cookie) = self.store.cookie_header_for_url(url)? {
-                headers.insert(COOKIE, HeaderValue::from_str(&stored_cookie)?);
-            }
+        if include_cookies {
+            headers = self.headers_with_cookies(url, headers, true)?;
         }
 
         if self.opts.verbose {
@@ -895,14 +919,16 @@ impl MoleClient {
             };
             eprintln!("> {} {target} HTTP/1.1", method.as_str());
             for (k, v) in &headers {
-                if let Ok(vs) = v.to_str() {
+                if is_sensitive_trace_header(k) {
+                    eprintln!("> {k}: <redacted>");
+                } else if let Ok(vs) = v.to_str() {
                     eprintln!("> {k}: {vs}");
                 }
             }
             eprintln!(">");
         }
 
-        let resp = self
+        let mut resp = self
             .opts
             .http_client
             .request(method.clone(), url.clone())
@@ -916,7 +942,9 @@ impl MoleClient {
         if self.opts.verbose {
             eprintln!("< {:?} {status}", resp.version());
             for (k, v) in &resp_headers {
-                if let Ok(vs) = v.to_str() {
+                if is_sensitive_trace_header(k) {
+                    eprintln!("< {k}: <redacted>");
+                } else if let Ok(vs) = v.to_str() {
                     eprintln!("< {k}: {vs}");
                 }
             }
@@ -932,12 +960,154 @@ impl MoleClient {
             self.store.store_set_cookies(url, set_cookies)?;
         }
 
-        let resp_body = resp.bytes().await?;
+        let resp_body = read_response_body_limited(&mut resp, MAX_RESPONSE_BODY_BYTES).await?;
         Ok(HttpResponseData {
             status,
             headers: resp_headers,
             body: resp_body,
             effective_url: url.clone(),
         })
+    }
+
+    fn headers_with_cookies(
+        &self,
+        url: &Url,
+        mut headers: HeaderMap,
+        include_explicit_cookie: bool,
+    ) -> anyhow::Result<HeaderMap> {
+        if !headers.contains_key(COOKIE) {
+            if include_explicit_cookie && let Some(ref explicit) = self.opts.explicit_cookie_header
+            {
+                headers.insert(COOKIE, HeaderValue::from_str(explicit)?);
+            } else if let Some(stored_cookie) = self.store.cookie_header_for_url(url)? {
+                headers.insert(COOKIE, HeaderValue::from_str(&stored_cookie)?);
+            }
+        }
+        Ok(headers)
+    }
+}
+
+fn is_sensitive_trace_header(name: &http::HeaderName) -> bool {
+    name == AUTHORIZATION
+        || name == PROXY_AUTHORIZATION
+        || name == COOKIE
+        || name == SET_COOKIE
+        || name == MOLE_SESSION_HEADER
+        || name == MOLE_CREDENTIAL_HEADER
+}
+
+async fn read_response_body_limited(
+    response: &mut reqwest::Response,
+    max_bytes: usize,
+) -> anyhow::Result<Bytes> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_bytes as u64)
+    {
+        bail!("HTTP response body exceeds {max_bytes} byte limit");
+    }
+
+    let initial_capacity = response
+        .content_length()
+        .and_then(|length| usize::try_from(length).ok())
+        .unwrap_or(0)
+        .min(max_bytes);
+    let mut body = BytesMut::with_capacity(initial_capacity);
+    while let Some(chunk) = response.chunk().await? {
+        let next_len = body
+            .len()
+            .checked_add(chunk.len())
+            .ok_or_else(|| anyhow::anyhow!("HTTP response body length overflow"))?;
+        if next_len > max_bytes {
+            bail!("HTTP response body exceeds {max_bytes} byte limit");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body.freeze())
+}
+
+fn redirect_headers(original: &HeaderMap, same_origin: bool, body_was_cleared: bool) -> HeaderMap {
+    let mut headers = original.clone();
+    if !same_origin {
+        headers.remove(AUTHORIZATION);
+        headers.remove(COOKIE);
+        headers.remove(HOST);
+        headers.remove(PROXY_AUTHORIZATION);
+    }
+    if body_was_cleared {
+        headers.remove(CONTENT_LENGTH);
+        headers.remove(CONTENT_TYPE);
+        headers.remove(TRANSFER_ENCODING);
+    }
+    headers
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cross_origin_redirect_strips_credentials_and_body_metadata() {
+        let mut original = HeaderMap::new();
+        original.insert(AUTHORIZATION, HeaderValue::from_static("Bearer secret"));
+        original.insert(COOKIE, HeaderValue::from_static("session=secret"));
+        original.insert(HOST, HeaderValue::from_static("first.example"));
+        original.insert(
+            PROXY_AUTHORIZATION,
+            HeaderValue::from_static("Basic c2VjcmV0"),
+        );
+        original.insert(CONTENT_LENGTH, HeaderValue::from_static("7"));
+        original.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        original.insert("x-retained", HeaderValue::from_static("yes"));
+
+        let redirected = redirect_headers(&original, false, true);
+        assert!(redirected.get(AUTHORIZATION).is_none());
+        assert!(redirected.get(COOKIE).is_none());
+        assert!(redirected.get(HOST).is_none());
+        assert!(redirected.get(PROXY_AUTHORIZATION).is_none());
+        assert!(redirected.get(CONTENT_LENGTH).is_none());
+        assert!(redirected.get(CONTENT_TYPE).is_none());
+        assert_eq!(redirected.get("x-retained").unwrap(), "yes");
+    }
+
+    #[test]
+    fn explicit_cookie_is_scoped_to_initial_origin() {
+        prototalpid_http::tls::ensure_crypto_provider();
+        let store = Arc::new(WalletStore::open(None).unwrap());
+        let mut options = MoleClientOptions::new(reqwest::Client::new());
+        options.explicit_cookie_header = Some("explicit=secret".to_owned());
+        let client = MoleClient::new(store, options);
+        let url = Url::parse("https://redirected.example/").unwrap();
+
+        assert_eq!(
+            client
+                .headers_with_cookies(&url, HeaderMap::new(), true)
+                .unwrap()
+                .get(COOKIE)
+                .unwrap(),
+            "explicit=secret",
+        );
+        assert!(
+            client
+                .headers_with_cookies(&url, HeaderMap::new(), false)
+                .unwrap()
+                .get(COOKIE)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn credential_bearing_trace_headers_are_sensitive() {
+        for name in [
+            &AUTHORIZATION,
+            &PROXY_AUTHORIZATION,
+            &COOKIE,
+            &SET_COOKIE,
+            &MOLE_SESSION_HEADER,
+            &MOLE_CREDENTIAL_HEADER,
+        ] {
+            assert!(is_sensitive_trace_header(name));
+        }
+        assert!(!is_sensitive_trace_header(&CONTENT_TYPE));
     }
 }

@@ -47,7 +47,9 @@ pub fn validate_https_endpoint_uri(uri: &str) -> Result<Url, Error> {
 /// Returns the canonical origin string (`https://host[:port]`) for an HTTPS URL.
 pub fn canonical_https_origin(url: &Url) -> Result<String, Error> {
     if url.scheme() != "https" || !url.has_host() {
-        return Err(Error::InvalidConfig("URL must be an https origin with a host"));
+        return Err(Error::InvalidConfig(
+            "URL must be an https origin with a host",
+        ));
     }
     Ok(url.origin().ascii_serialization())
 }
@@ -172,6 +174,16 @@ impl EcIhatEndorsementConfig {
         if self.issuance_epoch.len() > u16::MAX as usize {
             return Err(Error::InvalidConfig("issuance-epoch exceeds 65535 bytes"));
         }
+        let mut unique_keys = HashSet::new();
+        if self
+            .anchor_set
+            .iter()
+            .any(|raw| !unique_keys.insert(raw.as_slice()))
+        {
+            return Err(Error::InvalidConfig(
+                "anchor-set must not contain duplicate public keys",
+            ));
+        }
         self.anchor_set
             .iter()
             .map(|raw| {
@@ -183,6 +195,26 @@ impl EcIhatEndorsementConfig {
                     .map_err(|_| Error::InvalidConfig("invalid P-256 point in anchor-set"))
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ec_ihat::{Backend as _, DefaultBackend as IhatBackend};
+
+    #[test]
+    fn duplicate_anchor_keys_are_rejected() {
+        let seed = IhatBackend::generate_seed().unwrap();
+        let secret_key: ec_ihat::SecretKey = ec_ihat::SecretKey::from_seed(&seed).unwrap();
+        let key = secret_key.public_key().to_bytes().to_vec();
+        let config = EcIhatEndorsementConfig {
+            endorsement_type: EndorsementType::EC_IHAT.0,
+            ciphersuite: CIPHERSUITE_P256_SHA256.to_owned(),
+            issuance_epoch: b"epoch".to_vec(),
+            anchor_set: vec![key.clone(), key],
+        };
+        assert!(config.decode_anchor_set().is_err());
     }
 }
 

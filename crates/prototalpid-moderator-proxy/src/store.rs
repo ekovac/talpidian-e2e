@@ -4,19 +4,19 @@
 
 #![allow(clippy::type_complexity)]
 
+use std::collections::HashSet;
+use std::fs::{self, OpenOptions};
 use std::path::Path;
 use std::sync::Mutex;
 
 use ec_act::{Backend as _, DefaultBackend as ActBackend};
 use hmac::{Hmac, KeyInit, Mac};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
-use prototalpid_http::config::{
-    EcActKeyConfig, EcIhatEndorsementConfig, ModeratorConfiguration,
-};
+use prototalpid_http::config::{EcActKeyConfig, EcIhatEndorsementConfig, ModeratorConfiguration};
 use prototalpid_http::schemes::{
     CIPHERSUITE_P256_SHA256, CredentialType, EC_IHAT_CTX_RED, EndorsementType,
     compute_ec_act_key_id, derive_ec_act_ctx_cred, truncated_key_id,
@@ -118,9 +118,15 @@ pub enum PresentationVerdict {
 /// Errors from Moderator store operations.
 #[derive(Debug, thiserror::Error)]
 pub enum ModeratorError {
+    /// Filesystem error while creating or protecting the database.
+    #[error("filesystem error: {0}")]
+    Io(#[from] std::io::Error),
     /// SQLite error.
     #[error("database error: {0}")]
     Db(#[from] rusqlite::Error),
+    /// Invalid persistent or runtime configuration.
+    #[error("invalid configuration: {0}")]
+    InvalidConfig(&'static str),
     /// Malformed client payload (`400`).
     #[error("malformed request: {0}")]
     BadRequest(&'static str),
@@ -171,8 +177,30 @@ impl ModeratorStore {
         default_result_retention_secs: u64,
         anchor_sets: Vec<TrustedAnchorSet>,
     ) -> Result<Self, ModeratorError> {
+        if default_result_retention_secs > i64::MAX as u64 {
+            return Err(ModeratorError::InvalidConfig(
+                "result retention exceeds SQLite integer range",
+            ));
+        }
+        for set in &anchor_sets {
+            if set.public_keys.is_empty() {
+                return Err(ModeratorError::Internal(
+                    "trusted Anchor Set must not be empty",
+                ));
+            }
+            let mut unique_keys = HashSet::new();
+            if set
+                .public_keys
+                .iter()
+                .any(|key| !unique_keys.insert(key.to_bytes()))
+            {
+                return Err(ModeratorError::Internal(
+                    "trusted Anchor Set contains duplicate public keys",
+                ));
+            }
+        }
         let conn = match db_path {
-            Some(p) => Connection::open(p)?,
+            Some(p) => open_private_database(p)?,
             None => Connection::open_in_memory()?,
         };
         conn.execute_batch(
@@ -250,7 +278,10 @@ impl ModeratorStore {
                     .as_slice()
                     .try_into()
                     .map_err(|_| ModeratorError::Internal("corrupt HMAC secret"))?;
-                (s, hm, bw, cctx, ret as u64)
+                let retention = u64::try_from(ret).map_err(|_| {
+                    ModeratorError::InvalidConfig("stored result retention is negative")
+                })?;
+                (s, hm, bw, cctx, retention)
             } else {
                 let seed = ActBackend::generate_seed()
                     .map_err(|_| ModeratorError::Internal("failed to generate EC-ACT seed"))?;
@@ -305,6 +336,65 @@ impl ModeratorStore {
         })
     }
 
+    /// Validates runtime moderation values against the persisted EC-ACT parameters and
+    /// the signed integer fields used by SQLite.
+    pub fn validate_policy(&self, policy: &ModerationPolicy) -> Result<(), ModeratorError> {
+        let max_amount = if self.params.balance_width() == 64 {
+            u64::MAX
+        } else {
+            (1u64 << self.params.balance_width()) - 1
+        };
+        if policy.initial_credits > max_amount
+            || policy.deposit_credits > max_amount
+            || policy.max_top_up > max_amount
+        {
+            return Err(ModeratorError::InvalidConfig(
+                "credit amount exceeds EC-ACT balance width",
+            ));
+        }
+        if policy.deposit_credits > policy.initial_credits {
+            return Err(ModeratorError::InvalidConfig(
+                "deposit credits exceed initial balance",
+            ));
+        }
+        if policy
+            .initial_credits
+            .checked_add(policy.max_top_up)
+            .is_none()
+            || policy.initial_credits + policy.max_top_up > max_amount
+        {
+            return Err(ModeratorError::InvalidConfig(
+                "initial balance plus top-up exceeds EC-ACT balance width",
+            ));
+        }
+        if policy.deposit_credits > i64::MAX as u64 {
+            return Err(ModeratorError::InvalidConfig(
+                "deposit credits exceed SQLite integer range",
+            ));
+        }
+        if policy.hold_duration_secs > i64::MAX as u64 {
+            return Err(ModeratorError::InvalidConfig(
+                "hold duration exceeds timestamp range",
+            ));
+        }
+        if policy.rate_window_secs == 0 || policy.rate_window_secs > i64::MAX as u64 {
+            return Err(ModeratorError::InvalidConfig(
+                "rate window must be in 1..=i64::MAX seconds",
+            ));
+        }
+        if policy.challenge_window_secs == 0 || policy.challenge_window_secs > i64::MAX as u64 {
+            return Err(ModeratorError::InvalidConfig(
+                "challenge window must be in 1..=i64::MAX seconds",
+            ));
+        }
+        if policy.max_requests_per_window == 0 {
+            return Err(ModeratorError::InvalidConfig(
+                "max requests per window must be greater than zero",
+            ));
+        }
+        Ok(())
+    }
+
     /// Builds the JSON [`ModeratorConfiguration`] published at `/.well-known/mole-moderator`.
     pub fn build_configuration(
         &self,
@@ -318,7 +408,11 @@ impl ModeratorStore {
                 endorsement_type: EndorsementType::EC_IHAT.0,
                 ciphersuite: CIPHERSUITE_P256_SHA256.to_owned(),
                 issuance_epoch: s.issuance_epoch.clone(),
-                anchor_set: s.public_keys.iter().map(|pk| pk.to_bytes().to_vec()).collect(),
+                anchor_set: s
+                    .public_keys
+                    .iter()
+                    .map(|pk| pk.to_bytes().to_vec())
+                    .collect(),
             })
             .collect();
 
@@ -348,6 +442,7 @@ impl ModeratorStore {
     ) -> RedemptionChallenge {
         self.redemption_challenge_for_bucket(
             public_origin,
+            policy,
             current_bucket(policy.challenge_window_secs),
         )
     }
@@ -355,33 +450,33 @@ impl ModeratorStore {
     fn redemption_challenge_for_bucket(
         &self,
         public_origin: &str,
+        policy: &ModerationPolicy,
         bucket: u64,
     ) -> RedemptionChallenge {
+        let policy_binding = self.redemption_policy_binding(policy);
         RedemptionChallenge {
-            redemption_context: hmac_sha256(
+            redemption_context: hmac_sha256_framed(
                 &self.hmac_secret,
+                b"MOLE-REDEEM-v2",
                 &[
-                    b"MOLE-REDEEM-v1|",
                     public_origin.as_bytes(),
-                    b"|",
+                    &policy_binding,
                     &bucket.to_be_bytes(),
                 ],
             ),
         }
     }
 
-    /// Constructs a stateless request-bound `EcActChallenge` for `(public_origin, method, path_and_query)`.
+    /// Constructs a stateless `EcActChallenge` bound to the canonical protected request.
     pub fn issue_ec_act_challenge(
         &self,
         public_origin: &str,
-        method: &str,
-        path_and_query: &str,
+        request_binding: &[u8; 32],
         policy: &ModerationPolicy,
     ) -> EcActChallenge {
         self.ec_act_challenge_for_bucket(
             public_origin,
-            method,
-            path_and_query,
+            request_binding,
             policy,
             current_bucket(policy.challenge_window_secs),
         )
@@ -390,21 +485,16 @@ impl ModeratorStore {
     fn ec_act_challenge_for_bucket(
         &self,
         public_origin: &str,
-        method: &str,
-        path_and_query: &str,
+        request_binding: &[u8; 32],
         policy: &ModerationPolicy,
         bucket: u64,
     ) -> EcActChallenge {
-        let request_context = hmac_sha256(
+        let request_context = hmac_sha256_framed(
             &self.hmac_secret,
+            b"MOLE-SPEND-v2",
             &[
-                b"MOLE-SPEND-v1|",
                 public_origin.as_bytes(),
-                b"|",
-                method.as_bytes(),
-                b"|",
-                path_and_query.as_bytes(),
-                b"|",
+                request_binding,
                 &bucket.to_be_bytes(),
             ],
         )
@@ -415,6 +505,31 @@ impl ModeratorStore {
             credential_context: self.credential_context.clone(),
             request_context,
         }
+    }
+
+    fn redemption_policy_binding(&self, policy: &ModerationPolicy) -> [u8; 32] {
+        let mut hash = Sha256::new();
+        hash_framed(&mut hash, b"MOLE-REDEMPTION-POLICY-v1");
+        hash_framed(&mut hash, &policy.initial_credits.to_be_bytes());
+        hash_framed(&mut hash, &policy.deposit_credits.to_be_bytes());
+        hash_framed(&mut hash, &policy.max_top_up.to_be_bytes());
+        hash_framed(&mut hash, &policy.hold_duration_secs.to_be_bytes());
+        hash_framed(&mut hash, &policy.rate_window_secs.to_be_bytes());
+        hash_framed(&mut hash, &policy.max_requests_per_window.to_be_bytes());
+        hash_framed(&mut hash, &[u8::from(policy.revoke_chain_on_flood)]);
+        hash_framed(&mut hash, &policy.challenge_window_secs.to_be_bytes());
+        hash_framed(&mut hash, &[u8::from(policy.allow_no_endorsement)]);
+        hash_framed(&mut hash, &self.key_id);
+        hash_framed(&mut hash, &self.credential_context);
+        hash_framed(&mut hash, &(self.anchor_sets.len() as u64).to_be_bytes());
+        for set in &self.anchor_sets {
+            hash_framed(&mut hash, &set.issuance_epoch);
+            hash_framed(&mut hash, &(set.public_keys.len() as u64).to_be_bytes());
+            for public_key in &set.public_keys {
+                hash_framed(&mut hash, &public_key.to_bytes());
+            }
+        }
+        hash.finalize().into()
     }
 
     /// Processes `RedeemAndIssue` on `/mole/issue` (`draft-jms-mole-protocols` §5.2.2).
@@ -471,7 +586,7 @@ impl ModeratorStore {
                     };
                     decoded_any = true;
                     for &b in &buckets {
-                        let chal = self.redemption_challenge_for_bucket(public_origin, b);
+                        let chal = self.redemption_challenge_for_bucket(public_origin, policy, b);
                         if let Ok(nf) = ec_ihat::verify_redemption(
                             &set.public_keys,
                             &redemption,
@@ -646,8 +761,7 @@ impl ModeratorStore {
     pub fn process_presentation(
         &self,
         public_origin: &str,
-        method: &str,
-        path_and_query: &str,
+        request_binding: &[u8; 32],
         policy: &ModerationPolicy,
         credential_type: CredentialType,
         presentation_bytes: &[u8],
@@ -703,13 +817,7 @@ impl ModeratorStore {
         let mut immediate_refund_bytes: Option<Vec<u8>> = None;
 
         for &b in &buckets {
-            let chal = self.ec_act_challenge_for_bucket(
-                public_origin,
-                method,
-                path_and_query,
-                policy,
-                b,
-            );
+            let chal = self.ec_act_challenge_for_bucket(public_origin, request_binding, policy, b);
             let Ok(ctx_spend) = chal.ctx_spend() else {
                 continue;
             };
@@ -737,13 +845,9 @@ impl ModeratorStore {
         let mut conn = self.conn.lock().expect("ModeratorStore mutex poisoned");
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        if let Some(verdict) = self.lookup_existing_nullifier_in_tx(
-            &tx,
-            &recv_key_id,
-            &nullifier,
-            &pres_sha256,
-            now,
-        )? {
+        if let Some(verdict) =
+            self.lookup_existing_nullifier_in_tx(&tx, &recv_key_id, &nullifier, &pres_sha256, now)?
+        {
             tx.commit()?;
             return Ok(verdict);
         }
@@ -862,7 +966,9 @@ impl ModeratorStore {
         settle_if_held: bool,
     ) -> Result<MoleCredentialHeader, ModeratorError> {
         if credential_type != CredentialType::EC_ACT {
-            return Err(ModeratorError::BadRequest("unsupported handle credential-type"));
+            return Err(ModeratorError::BadRequest(
+                "unsupported handle credential-type",
+            ));
         }
         let handle = RecoveryHandle::from_bytes(handle_bytes)
             .map_err(|_| ModeratorError::BadRequest("malformed 96-byte RecoveryHandle"))?;
@@ -987,9 +1093,7 @@ impl ModeratorStore {
 
         Ok(Some(
             match outcome_to_credential_header(rec.outcome_type.as_deref(), rec.refund_bytes) {
-                Some(mole_credential) => {
-                    PresentationVerdict::DuplicateRetained { mole_credential }
-                }
+                Some(mole_credential) => PresentationVerdict::DuplicateRetained { mole_credential },
                 None => PresentationVerdict::RejectedUnauthorized,
             },
         ))
@@ -1095,14 +1199,18 @@ impl ModeratorStore {
             });
         }
 
-        let spend_bytes =
-            spend_opt.ok_or(ModeratorError::Internal("missing held spend_bytes"))?;
+        let spend_bytes = spend_opt.ok_or(ModeratorError::Internal("missing held spend_bytes"))?;
         let ctx_spend = ctx_spend_opt.ok_or(ModeratorError::Internal("missing held ctx_spend"))?;
         let spend_msg = ec_act::SpendMessage::from_bytes(&self.params, &spend_bytes)
             .map_err(|_| ModeratorError::Internal("corrupt stored spend_bytes"))?;
-        let verified =
-            ec_act::verify_spend(&self.params, &self.secret_key, ctx_cred, &ctx_spend, &spend_msg)
-                .map_err(|_| ModeratorError::Internal("stored spend failed re-verification"))?;
+        let verified = ec_act::verify_spend(
+            &self.params,
+            &self.secret_key,
+            ctx_cred,
+            &ctx_spend,
+            &spend_msg,
+        )
+        .map_err(|_| ModeratorError::Internal("stored spend failed re-verification"))?;
         let refund_amount = spend_amount.saturating_sub(penalty_credits);
         let refund_msg = ec_act::issue_refund(verified, refund_amount)
             .map_err(|_| ModeratorError::Internal("issue_refund failed during finalization"))?;
@@ -1133,6 +1241,23 @@ impl ModeratorStore {
     }
 }
 
+fn open_private_database(path: &Path) -> Result<Connection, ModeratorError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(path)?;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(Connection::open(path)?)
+}
+
 fn sha256_matches(stored: &[u8], expected: &[u8; 32]) -> bool {
     stored.len() == 32 && bool::from(stored.ct_eq(expected))
 }
@@ -1154,14 +1279,89 @@ fn outcome_to_credential_header(
     }
 }
 
-fn hmac_sha256(key: &[u8; 32], parts: &[&[u8]]) -> [u8; 32] {
+fn hmac_sha256_framed(key: &[u8; 32], domain: &[u8], parts: &[&[u8]]) -> [u8; 32] {
     let mut mac = HmacSha256::new_from_slice(key).expect("32-byte HMAC key is always valid");
+    mac.update(&(domain.len() as u64).to_be_bytes());
+    mac.update(domain);
     for part in parts {
+        mac.update(&(part.len() as u64).to_be_bytes());
         mac.update(part);
     }
     mac.finalize().into_bytes().into()
 }
 
+fn hash_framed(hash: &mut Sha256, value: &[u8]) {
+    hash.update((value.len() as u64).to_be_bytes());
+    hash.update(value);
+}
+
 fn current_bucket(window_secs: u64) -> u64 {
     (unix_now().max(0) as u64) / window_secs.max(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn framed_hmac_has_no_delimiter_ambiguity() {
+        let key = [7u8; 32];
+        assert_ne!(
+            hmac_sha256_framed(&key, b"test", &[b"a|b", b"c"]),
+            hmac_sha256_framed(&key, b"test", &[b"a", b"b|c"]),
+        );
+    }
+
+    #[test]
+    fn redemption_challenge_binds_issuance_policy() {
+        let store = ModeratorStore::open(None, 8, b"ctx", 300, Vec::new()).unwrap();
+        let policy = ModerationPolicy::default();
+        let original = store.issue_redemption_challenge("https://moderator.example", &policy);
+
+        let mut changed = policy;
+        changed.initial_credits += 1;
+        let after_change = store.issue_redemption_challenge("https://moderator.example", &changed);
+
+        assert_ne!(original.redemption_context, after_change.redemption_context);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persistent_database_permissions_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("moderator.db");
+        fs::write(&path, []).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let _store = ModeratorStore::open(Some(&path), 8, b"ctx", 300, Vec::new()).unwrap();
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn invalid_moderation_policy_is_rejected() {
+        let store = ModeratorStore::open(None, 8, b"ctx", 300, Vec::new()).unwrap();
+        let policy = ModerationPolicy {
+            deposit_credits: ModerationPolicy::default().initial_credits + 1,
+            ..ModerationPolicy::default()
+        };
+        assert!(store.validate_policy(&policy).is_err());
+
+        let policy = ModerationPolicy {
+            rate_window_secs: 0,
+            ..ModerationPolicy::default()
+        };
+        assert!(store.validate_policy(&policy).is_err());
+
+        let policy = ModerationPolicy {
+            initial_credits: 250,
+            max_top_up: 10,
+            ..ModerationPolicy::default()
+        };
+        assert!(store.validate_policy(&policy).is_err());
+    }
 }

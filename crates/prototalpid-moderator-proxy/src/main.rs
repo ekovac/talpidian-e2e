@@ -11,9 +11,10 @@ use prototalpid_http::config::{AnchorConfiguration, anchor_well_known_url};
 use prototalpid_http::server::{TlsServerArgs, init_tracing};
 use prototalpid_http::tls::build_http_client;
 use prototalpid_moderator_proxy::{
-    ModerationPolicy, ModeratorProxyConfig, ModeratorStore, TrustedAnchorSet,
-    spawn_moderator_proxy,
+    ModerationPolicy, ModeratorProxyConfig, ModeratorStore, TrustedAnchorSet, spawn_moderator_proxy,
 };
+
+const MAX_ANCHOR_CONFIG_BYTES: usize = 1024 * 1024;
 
 /// HTTPS MOLE Moderator reverse proxy protecting an upstream web server.
 #[derive(Debug, Parser)]
@@ -99,15 +100,17 @@ async fn main() -> anyhow::Result<()> {
     let mut anchor_pks = Vec::with_capacity(cli.anchors.len());
     for anchor_url in &cli.anchors {
         let wk = anchor_well_known_url(anchor_url)?;
-        let cfg: AnchorConfiguration = anchor_client
+        let mut response = anchor_client
             .get(wk.clone())
             .send()
             .await
             .with_context(|| format!("failed to connect to {wk}"))?
             .error_for_status()
-            .with_context(|| format!("HTTP error fetching {wk}"))?
-            .json()
+            .with_context(|| format!("HTTP error fetching {wk}"))?;
+        let body = read_limited_body(&mut response, MAX_ANCHOR_CONFIG_BYTES)
             .await
+            .with_context(|| format!("AnchorConfiguration from {wk} is too large"))?;
+        let cfg: AnchorConfiguration = serde_json::from_slice(&body)
             .with_context(|| format!("invalid AnchorConfiguration JSON from {wk}"))?;
         let (_, pk) = cfg.validate_ec_ihat()?;
         if let Some(ref ep) = epoch_opt {
@@ -162,4 +165,35 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("shutting down prototalpid-moderator-proxy");
     server.shutdown().await;
     Ok(())
+}
+
+async fn read_limited_body(
+    response: &mut reqwest::Response,
+    max_bytes: usize,
+) -> anyhow::Result<Vec<u8>> {
+    anyhow::ensure!(
+        response
+            .content_length()
+            .is_none_or(|length| length <= max_bytes as u64),
+        "response body exceeds {max_bytes} byte limit"
+    );
+    let mut body = Vec::with_capacity(
+        response
+            .content_length()
+            .and_then(|length| usize::try_from(length).ok())
+            .unwrap_or(0)
+            .min(max_bytes),
+    );
+    while let Some(chunk) = response.chunk().await? {
+        let next_len = body
+            .len()
+            .checked_add(chunk.len())
+            .ok_or_else(|| anyhow::anyhow!("response body length overflow"))?;
+        anyhow::ensure!(
+            next_len <= max_bytes,
+            "response body exceeds {max_bytes} byte limit"
+        );
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }

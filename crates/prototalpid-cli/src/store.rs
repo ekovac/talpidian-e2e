@@ -1,7 +1,8 @@
 //! Persistent SQLite wallet & cookie jar for `prototalpid-cli` (XDG-backed with `0600`
 //! permissions on Unix).
 
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -150,13 +151,20 @@ impl WalletStore {
                         fs::create_dir_all(parent)?;
                     }
                 }
-                let c = Connection::open(p)?;
                 #[cfg(unix)]
                 {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = fs::set_permissions(p, fs::Permissions::from_mode(0o600));
+                    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+                    let file = OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .create(true)
+                        .truncate(false)
+                        .mode(0o600)
+                        .open(p)?;
+                    file.set_permissions(fs::Permissions::from_mode(0o600))?;
                 }
-                c
+                Connection::open(p)?
             }
             None => Connection::open_in_memory()?,
         };
@@ -169,6 +177,7 @@ impl WalletStore {
 
              CREATE TABLE IF NOT EXISTS cookies (
                  host TEXT NOT NULL,
+                 host_only INTEGER NOT NULL DEFAULT 1,
                  path TEXT NOT NULL,
                  name TEXT NOT NULL,
                  value TEXT NOT NULL,
@@ -236,6 +245,23 @@ impl WalletStore {
              );",
         )?;
 
+        let has_cookie_host_only = {
+            let mut stmt = conn.prepare("PRAGMA table_info(cookies)")?;
+            let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            columns
+                .collect::<Result<Vec<_>, _>>()?
+                .iter()
+                .any(|column| column == "host_only")
+        };
+        if !has_cookie_host_only {
+            // Old stores did not distinguish host-only cookies from Domain cookies and
+            // consequently sent every cookie to subdomains. Migrate conservatively.
+            conn.execute(
+                "ALTER TABLE cookies ADD COLUMN host_only INTEGER NOT NULL DEFAULT 1",
+                [],
+            )?;
+        }
+
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -265,21 +291,47 @@ impl WalletStore {
             if name.is_empty() {
                 continue;
             }
+            let secure = parsed.secure().unwrap_or(false);
+            let secure_origin = url.scheme() == "https";
+            if secure && !secure_origin {
+                continue;
+            }
             let path = parsed
                 .path()
                 .filter(|p| p.starts_with('/'))
-                .unwrap_or("/")
-                .to_owned();
-            let host = parsed
-                .domain()
-                .map(|d| d.trim_start_matches('.').to_ascii_lowercase())
-                .filter(|clean| {
-                    default_host == *clean || default_host.ends_with(&format!(".{clean}"))
-                })
-                .unwrap_or_else(|| default_host.clone());
+                .map(str::to_owned)
+                .unwrap_or_else(|| default_cookie_path(url.path()));
+            let (host, host_only) = match parsed.domain() {
+                None => (default_host.clone(), true),
+                Some(domain) => {
+                    let clean = domain.trim_start_matches('.').to_ascii_lowercase();
+                    // Without a public-suffix database, accepting a subdomain's parent-domain
+                    // cookie would allow dangerous values such as Domain=com. Only the exact
+                    // response host may deliberately create a Domain cookie.
+                    if clean != default_host || clean.parse::<std::net::IpAddr>().is_ok() {
+                        continue;
+                    }
+                    (clean, false)
+                }
+            };
+
+            if name.starts_with("__Secure-") && (!secure || !secure_origin) {
+                continue;
+            }
+            if name.starts_with("__Host-")
+                && (!secure || !secure_origin || !host_only || path != "/")
+            {
+                continue;
+            }
+
             let expires_at = parsed
                 .max_age()
-                .map(|d| now.saturating_add(d.whole_seconds()));
+                .map(|duration| now.saturating_add(duration.whole_seconds()))
+                .or_else(|| {
+                    parsed
+                        .expires_datetime()
+                        .map(|expiry| expiry.unix_timestamp())
+                });
 
             if expires_at.is_some_and(|exp| exp <= now) {
                 tx.execute(
@@ -290,19 +342,22 @@ impl WalletStore {
             }
 
             tx.execute(
-                "INSERT INTO cookies (host, path, name, value, secure, http_only, expires_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                "INSERT INTO cookies
+                 (host, host_only, path, name, value, secure, http_only, expires_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                  ON CONFLICT(host, path, name) DO UPDATE SET
+                     host_only = excluded.host_only,
                      value = excluded.value,
                      secure = excluded.secure,
                      http_only = excluded.http_only,
                      expires_at = excluded.expires_at",
                 params![
                     host,
+                    i32::from(host_only),
                     path,
                     name,
                     parsed.value(),
-                    i32::from(parsed.secure().unwrap_or(false)),
+                    i32::from(secure),
                     i32::from(parsed.http_only().unwrap_or(false)),
                     expires_at
                 ],
@@ -324,22 +379,23 @@ impl WalletStore {
 
         let conn = self.conn.lock().expect("WalletStore mutex poisoned");
         let mut stmt = conn.prepare(
-            "SELECT host, path, name, value, secure, expires_at FROM cookies",
+            "SELECT host, host_only, path, name, value, secure, expires_at FROM cookies",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
+                r.get::<_, i32>(1)? != 0,
                 r.get::<_, String>(2)?,
                 r.get::<_, String>(3)?,
-                r.get::<_, i32>(4)? != 0,
-                r.get::<_, Option<i64>>(5)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, i32>(5)? != 0,
+                r.get::<_, Option<i64>>(6)?,
             ))
         })?;
 
         let mut pairs = Vec::new();
         for row in rows {
-            let (host, path, name, value, secure, expires_at) = row?;
+            let (host, host_only, path, name, value, secure, expires_at) = row?;
             if let Some(exp) = expires_at
                 && exp <= now
             {
@@ -348,16 +404,28 @@ impl WalletStore {
             if secure && !is_https {
                 continue;
             }
-            let host_matches = req_host == host || req_host.ends_with(&format!(".{host}"));
-            let path_matches = req_path.starts_with(&path);
-            if host_matches && path_matches {
-                pairs.push(format!("{name}={value}"));
+            if cookie_domain_matches(&req_host, &host, host_only)
+                && cookie_path_matches(req_path, &path)
+            {
+                pairs.push((path.len(), host_only, host.len(), name, value));
             }
         }
         if pairs.is_empty() {
             Ok(None)
         } else {
-            Ok(Some(pairs.join("; ")))
+            pairs.sort_by(|a, b| {
+                b.0.cmp(&a.0)
+                    .then_with(|| b.1.cmp(&a.1))
+                    .then_with(|| b.2.cmp(&a.2))
+                    .then_with(|| a.3.cmp(&b.3))
+            });
+            Ok(Some(
+                pairs
+                    .into_iter()
+                    .map(|(_, _, _, name, value)| format!("{name}={value}"))
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            ))
         }
     }
 
@@ -365,25 +433,50 @@ impl WalletStore {
     pub fn export_cookie_jar(&self, path: &Path) -> anyhow::Result<()> {
         let conn = self.conn.lock().expect("WalletStore mutex poisoned");
         let mut stmt = conn.prepare(
-            "SELECT host, path, secure, expires_at, name, value FROM cookies ORDER BY host, path, name",
+            "SELECT host, host_only, path, secure, http_only, expires_at, name, value
+             FROM cookies ORDER BY host, path, name",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, i32>(2)? != 0,
-                r.get::<_, Option<i64>>(3)?.unwrap_or(0),
-                r.get::<_, String>(4)?,
-                r.get::<_, String>(5)?,
+                r.get::<_, i32>(1)? != 0,
+                r.get::<_, String>(2)?,
+                r.get::<_, i32>(3)? != 0,
+                r.get::<_, i32>(4)? != 0,
+                r.get::<_, Option<i64>>(5)?.unwrap_or(0),
+                r.get::<_, String>(6)?,
+                r.get::<_, String>(7)?,
             ))
         })?;
         let mut out = String::from("# Netscape HTTP Cookie File\n");
         for r in rows {
-            let (host, p, sec, exp, name, val) = r?;
+            let (host, host_only, p, sec, http_only, exp, name, val) = r?;
             let sec_str = if sec { "TRUE" } else { "FALSE" };
-            out.push_str(&format!("{host}\tFALSE\t{p}\t{sec_str}\t{exp}\t{name}\t{val}\n"));
+            let include_subdomains = if host_only { "FALSE" } else { "TRUE" };
+            if http_only {
+                out.push_str("#HttpOnly_");
+            }
+            if !host_only {
+                out.push('.');
+            }
+            out.push_str(&format!(
+                "{host}\t{include_subdomains}\t{p}\t{sec_str}\t{exp}\t{name}\t{val}\n"
+            ));
         }
-        fs::write(path, out)?;
+        let mut options = OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
+        file.write_all(out.as_bytes())?;
         Ok(())
     }
 
@@ -394,10 +487,14 @@ impl WalletStore {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         for line in text.lines() {
             let trimmed = line.trim();
-            if trimmed.is_empty() || trimmed.starts_with('#') {
+            let (http_only, cookie_line) = match trimmed.strip_prefix("#HttpOnly_") {
+                Some(line) => (true, line),
+                None => (false, trimmed),
+            };
+            if cookie_line.is_empty() || cookie_line.starts_with('#') {
                 continue;
             }
-            let cols: Vec<&str> = trimmed.split('\t').collect();
+            let cols: Vec<&str> = cookie_line.split('\t').collect();
             if cols.len() == 7 {
                 let host = cols[0].trim_start_matches('.').to_ascii_lowercase();
                 let cookie_path = cols[2];
@@ -406,14 +503,36 @@ impl WalletStore {
                 let expires_at = if exp_raw > 0 { Some(exp_raw) } else { None };
                 let name = cols[5];
                 let val = cols[6];
+                if host.is_empty()
+                    || cookie_path.is_empty()
+                    || !cookie_path.starts_with('/')
+                    || name.is_empty()
+                    || expires_at.is_some_and(|expiry| expiry <= unix_now())
+                {
+                    continue;
+                }
+                let include_subdomains = cols[1].eq_ignore_ascii_case("TRUE")
+                    && host.parse::<std::net::IpAddr>().is_err();
                 tx.execute(
-                    "INSERT INTO cookies (host, path, name, value, secure, http_only, expires_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)
+                    "INSERT INTO cookies
+                     (host, host_only, path, name, value, secure, http_only, expires_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                      ON CONFLICT(host, path, name) DO UPDATE SET
+                         host_only = excluded.host_only,
                          value = excluded.value,
                          secure = excluded.secure,
+                         http_only = excluded.http_only,
                          expires_at = excluded.expires_at",
-                    params![host, cookie_path, name, val, secure, expires_at],
+                    params![
+                        host,
+                        i32::from(!include_subdomains),
+                        cookie_path,
+                        name,
+                        val,
+                        secure,
+                        i32::from(http_only),
+                        expires_at
+                    ],
                 )?;
             }
         }
@@ -488,14 +607,15 @@ impl WalletStore {
             let mut stmt = tx.prepare(
                 "SELECT id, key_id, credential_context FROM credentials WHERE moderator_origin = ?1",
             )?;
-            let rows =
-                stmt.query_map(params![moderator_origin], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            let rows = stmt.query_map(params![moderator_origin], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
         for (row_id, kid, cctx) in existing_ids {
-            let still_active = active_keys
-                .iter()
-                .any(|k| k.key_id.as_slice() == kid.as_slice() && k.config.credential_context == cctx);
+            let still_active = active_keys.iter().any(|k| {
+                k.key_id.as_slice() == kid.as_slice() && k.config.credential_context == cctx
+            });
             if !still_active {
                 tx.execute("DELETE FROM credentials WHERE id = ?1", params![row_id])?;
             }
@@ -568,7 +688,8 @@ impl WalletStore {
                 .iter()
                 .position(|pk| pk.to_bytes().as_slice() == pk_vec.as_slice())
             {
-                let deleted = tx.execute("DELETE FROM endorsements WHERE id = ?1", params![row_id])?;
+                let deleted =
+                    tx.execute("DELETE FROM endorsements WHERE id = ?1", params![row_id])?;
                 if deleted == 1 {
                     let endorsement = ec_ihat::Endorsement::from_bytes(&end_bytes)
                         .map_err(|e| anyhow::anyhow!("corrupt stored endorsement: {e}"))?;
@@ -876,8 +997,7 @@ impl WalletStore {
             Some(upd_bytes) => {
                 let params = ec_act::Params::new(rec.balance_width)?;
                 let pk_m = ec_act::PublicKey::from_bytes(&rec.public_key_bytes)?;
-                let ctx_cred =
-                    derive_ec_act_ctx_cred(&rec.credential_context, rec.balance_width)?;
+                let ctx_cred = derive_ec_act_ctx_cred(&rec.credential_context, rec.balance_width)?;
                 let spend_state =
                     ec_act::ClientSpendState::from_bytes(&params, &rec.spend_state_bytes)?;
                 let upd = EcActUpdate::from_bytes(&params, upd_bytes)?;
@@ -998,8 +1118,7 @@ impl WalletStore {
             rows.collect::<Result<Vec<_>, _>>()?
         };
 
-        let cookie_count: i64 =
-            conn.query_row("SELECT COUNT(*) FROM cookies", [], |r| r.get(0))?;
+        let cookie_count: i64 = conn.query_row("SELECT COUNT(*) FROM cookies", [], |r| r.get(0))?;
 
         Ok(StoreStatus {
             endorsements,
@@ -1010,8 +1129,174 @@ impl WalletStore {
     }
 }
 
+fn default_cookie_path(request_path: &str) -> String {
+    if !request_path.starts_with('/') {
+        return "/".to_owned();
+    }
+    match request_path.rfind('/') {
+        Some(0) | None => "/".to_owned(),
+        Some(last_slash) => request_path[..last_slash].to_owned(),
+    }
+}
+
+fn cookie_domain_matches(request_host: &str, cookie_host: &str, host_only: bool) -> bool {
+    request_host == cookie_host
+        || (!host_only
+            && request_host
+                .strip_suffix(cookie_host)
+                .is_some_and(|prefix| prefix.ends_with('.')))
+}
+
+fn cookie_path_matches(request_path: &str, cookie_path: &str) -> bool {
+    request_path == cookie_path
+        || request_path
+            .strip_prefix(cookie_path)
+            .is_some_and(|suffix| {
+                cookie_path.ends_with('/') || suffix.as_bytes().first() == Some(&b'/')
+            })
+}
+
 /// Normalizes an origin or full HTTPS URL to `https://host[:port]`.
 pub fn normalize_origin_input(input: &str) -> anyhow::Result<String> {
     let url = Url::parse(input)?;
     Ok(canonical_https_origin(&url)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_only_cookies_do_not_leak_to_subdomains() {
+        let store = WalletStore::open(None).unwrap();
+        let origin = Url::parse("https://example.test/account/login").unwrap();
+        store
+            .store_set_cookies(
+                &origin,
+                [
+                    "host=one; Secure",
+                    "domain=two; Secure; Domain=example.test",
+                    "invalid=three; Secure; Domain=test",
+                ],
+            )
+            .unwrap();
+
+        let exact = store.cookie_header_for_url(&origin).unwrap().unwrap();
+        assert!(exact.contains("host=one"));
+        assert!(exact.contains("domain=two"));
+        assert!(!exact.contains("invalid="));
+
+        let subdomain = Url::parse("https://sub.example.test/account/login").unwrap();
+        assert_eq!(
+            store.cookie_header_for_url(&subdomain).unwrap().as_deref(),
+            Some("domain=two"),
+        );
+    }
+
+    #[test]
+    fn cookie_default_path_and_boundary_are_enforced() {
+        let store = WalletStore::open(None).unwrap();
+        let setter = Url::parse("https://example.test/private/page").unwrap();
+        store
+            .store_set_cookies(&setter, ["session=secret; Secure"])
+            .unwrap();
+
+        let inside = Url::parse("https://example.test/private/next").unwrap();
+        assert_eq!(
+            store.cookie_header_for_url(&inside).unwrap().as_deref(),
+            Some("session=secret"),
+        );
+        for outside in [
+            "https://example.test/privateer",
+            "https://example.test/public",
+        ] {
+            assert!(
+                store
+                    .cookie_header_for_url(&Url::parse(outside).unwrap())
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn cookie_expiry_secure_origin_and_prefix_rules_are_enforced() {
+        let store = WalletStore::open(None).unwrap();
+        let insecure = Url::parse("http://example.test/").unwrap();
+        store
+            .store_set_cookies(&insecure, ["secure=bad; Secure", "__Secure-prefixed=bad"])
+            .unwrap();
+        assert!(store.cookie_header_for_url(&insecure).unwrap().is_none());
+
+        let secure = Url::parse("https://example.test/").unwrap();
+        store
+            .store_set_cookies(
+                &secure,
+                [
+                    "expired=bad; Expires=Thu, 01 Jan 1970 00:00:00 GMT",
+                    "__Host-valid=ok; Secure; Path=/",
+                    "__Host-domain=bad; Secure; Path=/; Domain=example.test",
+                ],
+            )
+            .unwrap();
+        let header = store.cookie_header_for_url(&secure).unwrap().unwrap();
+        assert_eq!(header, "__Host-valid=ok");
+
+        store
+            .store_set_cookies(&secure, ["__Host-valid=gone; Secure; Path=/; Max-Age=0"])
+            .unwrap();
+        assert!(store.cookie_header_for_url(&secure).unwrap().is_none());
+    }
+
+    #[test]
+    fn old_cookie_schema_migrates_as_host_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("wallet.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE cookies (
+                host TEXT NOT NULL,
+                path TEXT NOT NULL,
+                name TEXT NOT NULL,
+                value TEXT NOT NULL,
+                secure INTEGER NOT NULL,
+                http_only INTEGER NOT NULL,
+                expires_at INTEGER,
+                PRIMARY KEY (host, path, name)
+             );
+             INSERT INTO cookies VALUES ('example.test', '/', 'old', 'secret', 1, 0, NULL);",
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = WalletStore::open(Some(&path)).unwrap();
+        let subdomain = Url::parse("https://sub.example.test/").unwrap();
+        assert!(store.cookie_header_for_url(&subdomain).unwrap().is_none());
+        let exact = Url::parse("https://example.test/").unwrap();
+        assert_eq!(
+            store.cookie_header_for_url(&exact).unwrap().as_deref(),
+            Some("old=secret"),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exported_cookie_jar_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let store = WalletStore::open(None).unwrap();
+        let origin = Url::parse("https://example.test/").unwrap();
+        store
+            .store_set_cookies(&origin, ["session=secret; Secure; HttpOnly"])
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cookies.txt");
+        store.export_cookie_jar(&path).unwrap();
+
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(fs::read_to_string(path).unwrap().contains("#HttpOnly_"));
+    }
 }
