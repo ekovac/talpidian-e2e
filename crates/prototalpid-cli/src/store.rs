@@ -79,6 +79,37 @@ pub struct PendingSpendSummary {
     pub remainder_balance: u64,
 }
 
+/// Durable lifecycle state of a pending client spend.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PendingSpendState {
+    /// Presentation was durably committed but no Moderator outcome was received.
+    InFlight,
+    /// The Moderator retained the spend and may have issued a session token.
+    Held,
+}
+
+impl PendingSpendState {
+    /// Stable SQLite representation.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InFlight => "in_flight",
+            Self::Held => "held",
+        }
+    }
+}
+
+impl TryFrom<&str> for PendingSpendState {
+    type Error = anyhow::Error;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "in_flight" => Ok(Self::InFlight),
+            "held" => Ok(Self::Held),
+            _ => anyhow::bail!("corrupt pending spend state: {value}"),
+        }
+    }
+}
+
 /// Loaded pending spend record for recovery / signoff / session attachment.
 #[derive(Clone, Debug)]
 pub struct PendingSpendRecord {
@@ -104,11 +135,11 @@ pub struct PendingSpendRecord {
     pub recovery_handle: RecoveryHandle,
     /// Presentations count prior to this spend.
     pub presentations_count: u64,
-    /// `'in_flight'` or `'held'`.
-    pub state: String,
-    /// Active `Mole-Session` token when `state == "held"`.
+    /// Durable lifecycle state.
+    pub state: PendingSpendState,
+    /// Active `Mole-Session` token when the state is [`PendingSpendState::Held`].
     pub session_token: Option<String>,
-    /// UNIX expiry timestamp when `state == "held"`.
+    /// UNIX expiry timestamp when the state is [`PendingSpendState::Held`].
     pub held_until: Option<i64>,
     /// Original HTTP method.
     pub original_method: String,
@@ -842,7 +873,7 @@ impl WalletStore {
               balance_width, credential_context, spend_state_bytes, presentation_bytes,
               recovery_handle, presentations_count, state, session_token, held_until,
               original_method, original_url, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'in_flight', NULL, NULL, ?12, ?13, ?14)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, NULL, NULL, ?13, ?14, ?15)",
             params![
                 moderator_origin,
                 issuance_uri,
@@ -855,6 +886,7 @@ impl WalletStore {
                 presentation_bytes,
                 handle_bytes.as_slice(),
                 presentations_count as i64,
+                PendingSpendState::InFlight.as_str(),
                 original_method,
                 original_url,
                 now
@@ -876,9 +908,14 @@ impl WalletStore {
         let conn = self.conn.lock().expect("WalletStore mutex poisoned");
         conn.execute(
             "UPDATE pending_spends
-             SET state = 'held', session_token = ?1, held_until = ?2
-             WHERE moderator_origin = ?3",
-            params![session_token, held_until, moderator_origin],
+             SET state = ?1, session_token = ?2, held_until = ?3
+             WHERE moderator_origin = ?4",
+            params![
+                PendingSpendState::Held.as_str(),
+                session_token,
+                held_until,
+                moderator_origin
+            ],
         )?;
         Ok(())
     }
@@ -962,7 +999,7 @@ impl WalletStore {
             presentation_bytes,
             recovery_handle,
             presentations_count,
-            state,
+            state: PendingSpendState::try_from(state.as_str())?,
             session_token,
             held_until,
             original_method,
@@ -1165,6 +1202,14 @@ pub fn normalize_origin_input(input: &str) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_spend_state_round_trips_and_rejects_corruption() {
+        for state in [PendingSpendState::InFlight, PendingSpendState::Held] {
+            assert_eq!(PendingSpendState::try_from(state.as_str()).unwrap(), state);
+        }
+        assert!(PendingSpendState::try_from("unknown").is_err());
+    }
 
     #[test]
     fn host_only_cookies_do_not_leak_to_subdomains() {

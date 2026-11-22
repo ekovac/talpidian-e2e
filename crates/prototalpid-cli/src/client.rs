@@ -22,7 +22,7 @@ use prototalpid_http::challenge::{
     AnchorChallengeOffer, AnchorChallengeSubmission, DEFAULT_ANCHOR_CHALLENGE_PATH, solve_pow,
 };
 use prototalpid_http::config::{
-    AnchorConfiguration, ModeratorConfiguration, SupportedModeratorEndorsement,
+    AnchorConfiguration, ModeratorConfiguration, SupportedModeratorEndorsement, ValidatedEcActKey,
     anchor_well_known_url, canonical_https_origin, moderator_well_known_url,
 };
 use prototalpid_http::schemes::{CredentialType, EC_IHAT_CTX_RED, EndorsementType};
@@ -37,7 +37,7 @@ use prototalpid_http::wire::{
     GrantChallenges, GrantCommitments, GrantRequest, GrantResponses, RedemptionChallenge,
 };
 
-use crate::store::{PendingSpendRecord, WalletStore};
+use crate::store::{PendingSpendRecord, PendingSpendState, UsableCredential, WalletStore};
 
 const MAX_RESPONSE_BODY_BYTES: usize = 64 * 1024 * 1024;
 
@@ -95,6 +95,21 @@ pub struct HttpResponseData {
 pub struct MoleClient {
     store: Arc<WalletStore>,
     opts: MoleClientOptions,
+}
+
+/// Material needed to prove and durably commit one challenged EC-ACT spend.
+struct SpendCredential {
+    issuance_url: Url,
+    active_key: ValidatedEcActKey,
+    usable: UsableCredential,
+}
+
+/// End-to-end request material frozen across the unauthenticated attempt and retry.
+struct FrozenRequest<'a> {
+    method: &'a Method,
+    url: &'a Url,
+    headers: HeaderMap,
+    body: &'a Bytes,
 }
 
 impl MoleClient {
@@ -345,7 +360,9 @@ impl MoleClient {
         let Some(pending) = self.store.get_pending_spend(moderator_origin)? else {
             return Ok(false);
         };
-        if pending.state == "held" && pending.held_until.is_some_and(|u| unix_now() >= u) {
+        if pending.state == PendingSpendState::Held
+            && pending.held_until.is_some_and(|u| unix_now() >= u)
+        {
             let _ = self.send_recovery(&pending).await?;
         } else {
             self.send_signoff(&pending).await?;
@@ -505,40 +522,8 @@ impl MoleClient {
 
         let moderator_origin = canonical_https_origin(url)?;
 
-        // Step 1: Pre-flight check on any pending or held spend for this Moderator origin.
-        let mut attached_session_token: Option<String> = None;
-        if let Some(pending) = self.store.get_pending_spend(&moderator_origin)? {
-            let now = unix_now();
-            match pending.state.as_str() {
-                "in_flight" => {
-                    self.vlog(format!(
-                        "MOLE: found interrupted in_flight spend for {moderator_origin}; recovering..."
-                    ));
-                    if !self.send_recovery(&pending).await? {
-                        self.send_signoff(&pending).await?;
-                    }
-                }
-                "held" => {
-                    let held_until = pending.held_until.unwrap_or(0);
-                    if now >= held_until {
-                        self.vlog(format!(
-                            "MOLE: hold expired for {moderator_origin}; sending recovery-0001"
-                        ));
-                        if !self.send_recovery(&pending).await? {
-                            self.store.discard_pending_spend(&moderator_origin)?;
-                        }
-                    } else if held_until - now <= self.opts.proactive_signoff_lead_secs {
-                        self.vlog(format!(
-                            "MOLE: hold near expiry for {moderator_origin}; proactively sending signoff-0001"
-                        ));
-                        self.send_signoff(&pending).await?;
-                    } else if let Some(ref tok) = pending.session_token {
-                        attached_session_token = Some(tok.clone());
-                    }
-                }
-                _ => {}
-            }
-        }
+        // Step 1: Reconcile durable spend state before attaching any active session.
+        let attached_session_token = self.prepare_pending_session(&moderator_origin).await?;
 
         // Step 2: Freeze the end-to-end request headers for the challenge/presentation pair.
         // In particular, discovery or issuance responses between the two attempts must not
@@ -567,16 +552,8 @@ impl MoleClient {
             return Ok(initial_resp);
         }
 
-        if let Some(pending) = self.store.get_pending_spend(&moderator_origin)? {
-            self.vlog("MOLE: active session challenged with 401; settling held credential first");
-            if pending.state == "held" && pending.held_until.is_some_and(|u| unix_now() >= u) {
-                if !self.send_recovery(&pending).await? {
-                    self.store.discard_pending_spend(&moderator_origin)?;
-                }
-            } else {
-                self.send_signoff(&pending).await?;
-            }
-        }
+        self.settle_pending_after_challenge(&moderator_origin)
+            .await?;
 
         let Some(act_chal_raw) = challenges.iter().find_map(|c| match c {
             MoleChallenge::Credential {
@@ -589,112 +566,232 @@ impl MoleClient {
         };
         let act_chal = EcActChallenge::from_bytes(&act_chal_raw)?;
 
-        let mod_cfg = self
-            .ensure_moderator_config(url, &moderator_origin, &act_chal, include_explicit_cookie)
+        let Some(spend_credential) = self
+            .obtain_spend_credential(
+                url,
+                &moderator_origin,
+                &act_chal,
+                &challenges,
+                include_explicit_cookie,
+            )
+            .await?
+        else {
+            return Ok(initial_resp);
+        };
+
+        // Step 4: ProveSpend, durably commit `in_flight`, and retry the frozen request.
+        self.present_credential(
+            FrozenRequest {
+                method,
+                url,
+                headers: base_headers,
+                body,
+            },
+            &moderator_origin,
+            &act_chal,
+            spend_credential,
+        )
+        .await
+    }
+
+    async fn prepare_pending_session(
+        &self,
+        moderator_origin: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let Some(pending) = self.store.get_pending_spend(moderator_origin)? else {
+            return Ok(None);
+        };
+
+        let now = unix_now();
+        match pending.state {
+            PendingSpendState::InFlight => {
+                self.vlog(format!(
+                    "MOLE: found interrupted in_flight spend for {moderator_origin}; recovering..."
+                ));
+                if !self.send_recovery(&pending).await? {
+                    self.send_signoff(&pending).await?;
+                }
+                Ok(None)
+            }
+            PendingSpendState::Held => {
+                let held_until = pending.held_until.unwrap_or(0);
+                if now >= held_until {
+                    self.vlog(format!(
+                        "MOLE: hold expired for {moderator_origin}; sending recovery-0001"
+                    ));
+                    if !self.send_recovery(&pending).await? {
+                        self.store.discard_pending_spend(moderator_origin)?;
+                    }
+                    Ok(None)
+                } else if held_until - now <= self.opts.proactive_signoff_lead_secs {
+                    self.vlog(format!(
+                        "MOLE: hold near expiry for {moderator_origin}; proactively sending signoff-0001"
+                    ));
+                    self.send_signoff(&pending).await?;
+                    Ok(None)
+                } else {
+                    Ok(pending.session_token)
+                }
+            }
+        }
+    }
+
+    async fn settle_pending_after_challenge(&self, moderator_origin: &str) -> anyhow::Result<()> {
+        let Some(pending) = self.store.get_pending_spend(moderator_origin)? else {
+            return Ok(());
+        };
+
+        self.vlog("MOLE: active session challenged with 401; settling held credential first");
+        if pending.state == PendingSpendState::Held
+            && pending.held_until.is_some_and(|until| unix_now() >= until)
+        {
+            if !self.send_recovery(&pending).await? {
+                self.store.discard_pending_spend(moderator_origin)?;
+            }
+        } else {
+            self.send_signoff(&pending).await?;
+        }
+        Ok(())
+    }
+
+    async fn obtain_spend_credential(
+        &self,
+        target_url: &Url,
+        moderator_origin: &str,
+        challenge: &EcActChallenge,
+        offered_challenges: &[MoleChallenge],
+        include_explicit_cookie: bool,
+    ) -> anyhow::Result<Option<SpendCredential>> {
+        let config = self
+            .ensure_moderator_config(
+                target_url,
+                moderator_origin,
+                challenge,
+                include_explicit_cookie,
+            )
             .await?;
-        let (issuance_url, sup_endorsements, sup_keys) = mod_cfg.parse_supported()?;
-        let Some(active_key) = sup_keys
-            .iter()
-            .find(|k| k.config.credential_context == act_chal.credential_context)
+        let (issuance_url, supported_endorsements, supported_keys) = config.parse_supported()?;
+        let Some(active_key) = supported_keys
+            .into_iter()
+            .find(|key| key.config.credential_context == challenge.credential_context)
         else {
             self.vlog(
                 "MOLE: Moderator has no active EC-ACT key matching challenged credential_context",
             );
-            return Ok(initial_resp);
+            return Ok(None);
         };
 
-        let mut usable_opt = self.store.find_usable_credential(
-            &moderator_origin,
-            &active_key.key_id,
-            &active_key.config.credential_context,
-            active_key.config.balance_width,
-            act_chal.spend_amount,
-            act_chal.max_top_up,
-        )?;
-
-        if usable_opt.is_none() {
+        let find_usable = || {
+            self.store.find_usable_credential(
+                moderator_origin,
+                &active_key.key_id,
+                &active_key.config.credential_context,
+                active_key.config.balance_width,
+                challenge.spend_amount,
+                challenge.max_top_up,
+            )
+        };
+        let mut usable = find_usable()?;
+        if usable.is_none() {
             let issued = self
                 .try_redeem_and_issue(
-                    &moderator_origin,
+                    moderator_origin,
                     &issuance_url,
-                    &challenges,
-                    &sup_endorsements,
-                    active_key,
+                    offered_challenges,
+                    &supported_endorsements,
+                    &active_key,
                 )
                 .await?;
             if !issued {
                 self.vlog(
                     "MOLE: no usable Credential with sufficient credits and no redeemable Endorsement available",
                 );
-                return Ok(initial_resp);
+                return Ok(None);
             }
-            usable_opt = self.store.find_usable_credential(
-                &moderator_origin,
-                &active_key.key_id,
-                &active_key.config.credential_context,
-                active_key.config.balance_width,
-                act_chal.spend_amount,
-                act_chal.max_top_up,
-            )?;
+            usable = find_usable()?;
         }
 
-        let Some(usable) = usable_opt else {
-            return Ok(initial_resp);
-        };
+        Ok(usable.map(|usable| SpendCredential {
+            issuance_url,
+            active_key,
+            usable,
+        }))
+    }
 
-        // Step 4: ProveSpend, durably commit `in_flight` state, and resend protected request!
+    async fn present_credential(
+        &self,
+        request: FrozenRequest<'_>,
+        moderator_origin: &str,
+        challenge: &EcActChallenge,
+        spend_credential: SpendCredential,
+    ) -> anyhow::Result<HttpResponseData> {
+        let SpendCredential {
+            issuance_url,
+            active_key,
+            usable,
+        } = spend_credential;
+        let UsableCredential {
+            id: credential_id,
+            credential,
+            presentations_count,
+        } = usable;
+
         let params = ec_act::Params::new(active_key.config.balance_width)?;
-        let ctx_spend = act_chal.ctx_spend()?;
-        let (spend_state, spend_msg) = ec_act::prove_spend(
+        let ctx_spend = challenge.ctx_spend()?;
+        let (spend_state, spend_message) = ec_act::prove_spend(
             &params,
-            usable.credential,
+            credential,
             &active_key.ctx_cred,
-            act_chal.spend_amount,
-            act_chal.max_top_up,
+            challenge.spend_amount,
+            challenge.max_top_up,
             &ctx_spend,
         )?;
-        let pres = EcActPresentationAndUpdate {
+        let presentation = EcActPresentationAndUpdate {
             key_id: active_key.key_id,
-            spend: spend_msg,
+            spend: spend_message,
         };
-        let pres_bytes = pres.to_bytes();
-        let recovery_handle = pres.recovery_handle();
+        let presentation_bytes = presentation.to_bytes();
+        let recovery_handle = presentation.recovery_handle();
 
         self.store.commit_in_flight_spend(
-            usable.id,
-            &moderator_origin,
+            credential_id,
+            moderator_origin,
             issuance_url.as_str(),
             &active_key.key_id,
             &active_key.public_key,
             active_key.config.balance_width,
             &active_key.config.credential_context,
             &spend_state,
-            &pres_bytes,
+            &presentation_bytes,
             &recovery_handle,
-            usable.presentations_count,
-            method.as_str(),
-            url.as_str(),
+            presentations_count,
+            request.method.as_str(),
+            request.url.as_str(),
         )?;
 
-        let auth_val = (MoleAuthorization::Presentation {
+        let authorization = (MoleAuthorization::Presentation {
             credential_type: CredentialType::EC_ACT,
-            presentation: pres_bytes,
+            presentation: presentation_bytes,
         })
         .to_header_value()?;
-
-        let mut retry_headers = base_headers;
-        retry_headers.insert(AUTHORIZATION, HeaderValue::from_str(&auth_val)?);
+        let mut retry_headers = request.headers;
+        retry_headers.insert(AUTHORIZATION, HeaderValue::from_str(&authorization)?);
         self.vlog(format!(
             "MOLE: presenting EC-ACT Credential (escrowing s={} credits)",
-            act_chal.spend_amount
+            challenge.spend_amount
         ));
 
-        let retry_resp = self
-            .raw_send(method, url, retry_headers, body.clone(), false)
+        let response = self
+            .raw_send(
+                request.method,
+                request.url,
+                retry_headers,
+                request.body.clone(),
+                false,
+            )
             .await?;
-
-        self.process_response_mole_credential(&moderator_origin, &retry_resp.headers)?;
-        Ok(retry_resp)
+        self.process_response_mole_credential(moderator_origin, &response.headers)?;
+        Ok(response)
     }
 
     fn process_response_mole_credential(

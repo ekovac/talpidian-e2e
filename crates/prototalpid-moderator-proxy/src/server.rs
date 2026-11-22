@@ -1,6 +1,5 @@
 //! HTTPS Moderator reverse proxy server (`axum` + `prototalpid_http::server` + `reqwest`).
 
-use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,14 +9,10 @@ use axum::body::{Bytes, to_bytes};
 use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use http::header::{
-    AUTHORIZATION, CACHE_CONTROL, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, HOST, HeaderMap,
-    HeaderName, HeaderValue, TRANSFER_ENCODING, UPGRADE, WWW_AUTHENTICATE,
-};
+use http::header::{CACHE_CONTROL, CONTENT_TYPE, HeaderMap, HeaderValue, WWW_AUTHENTICATE};
 use http::request::Parts;
 use http::{Method, StatusCode};
 use rustls::ServerConfig;
-use sha2::{Digest, Sha256};
 use url::Url;
 
 use prototalpid_http::config::WELL_KNOWN_MOLE_MODERATOR;
@@ -25,11 +20,13 @@ use prototalpid_http::schemes::{CredentialType, EndorsementType};
 use prototalpid_http::server::{SpawnedHttpsServer, json_error, json_no_store, spawn_https_router};
 use prototalpid_http::tls::ensure_crypto_provider;
 use prototalpid_http::transport::{
-    MOLE_CREDENTIAL_HEADER, MOLE_SESSION_HEADER, MoleAuthorization, MoleChallenge,
-    MoleCredentialHeader, apply_expose_auth_headers, apply_mole_credential_headers,
-    format_www_authenticate, parse_mole_session, parse_www_authenticate_str,
+    MOLE_SESSION_HEADER, MoleAuthorization, MoleChallenge, MoleCredentialHeader,
+    apply_expose_auth_headers, apply_mole_credential_headers, format_www_authenticate,
+    parse_mole_session,
 };
 
+pub use crate::request_policy::compute_request_binding;
+use crate::request_policy::{HeaderDirection, copy_filtered_headers};
 use crate::store::{
     ModerationPolicy, ModeratorError, ModeratorStore, PresentationVerdict, SessionVerdict,
 };
@@ -111,7 +108,9 @@ pub async fn spawn_moderator_proxy(
         let mut ticker = tokio::time::interval(maint_interval);
         loop {
             ticker.tick().await;
-            let _ = maint_store.run_maintenance_tick();
+            if let Err(error) = maint_store.run_maintenance_tick() {
+                tracing::error!(%error, "Moderator maintenance tick failed");
+            }
         }
     });
 
@@ -224,9 +223,36 @@ fn settle_response(
 }
 
 fn empty_credential_response(status: StatusCode, cred_hdr: &MoleCredentialHeader) -> Response {
+    let credential_headers = match prepare_credential_headers(cred_hdr) {
+        Ok(headers) => headers,
+        Err(error) => {
+            tracing::error!(%error, "failed to encode Mole-Credential response header");
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to encode credential response",
+            );
+        }
+    };
     let mut resp = status.into_response();
-    let _ = apply_mole_credential_headers(resp.headers_mut(), cred_hdr);
+    overwrite_headers(resp.headers_mut(), &credential_headers);
     resp
+}
+
+fn prepare_credential_headers(
+    credential: &MoleCredentialHeader,
+) -> Result<HeaderMap, prototalpid_http::Error> {
+    let mut headers = HeaderMap::new();
+    apply_mole_credential_headers(&mut headers, credential)?;
+    Ok(headers)
+}
+
+fn overwrite_headers(destination: &mut HeaderMap, source: &HeaderMap) {
+    for name in source.keys() {
+        let value = source
+            .get(name)
+            .expect("HeaderMap::keys only returns populated names");
+        destination.insert(name.clone(), value.clone());
+    }
 }
 
 async fn handle_proxied_resource(
@@ -298,13 +324,34 @@ async fn handle_proxied_resource(
                 session_token,
                 mole_credential,
             } => {
+                let credential_headers = match prepare_credential_headers(&mole_credential) {
+                    Ok(headers) => headers,
+                    Err(error) => {
+                        tracing::error!(%error, "failed to encode Mole-Credential response header");
+                        return json_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "failed to encode credential response",
+                        );
+                    }
+                };
+                let session_header = match session_token {
+                    Some(token) => match HeaderValue::from_str(&token) {
+                        Ok(value) => Some(value),
+                        Err(error) => {
+                            tracing::error!(%error, "failed to encode Mole-Session response header");
+                            return json_error(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                "failed to encode session response",
+                            );
+                        }
+                    },
+                    None => None,
+                };
                 let mut resp = forward_to_upstream(&app, parts, body_bytes, true).await;
-                if let Some(tok) = session_token
-                    && let Ok(hv) = HeaderValue::from_str(&tok)
-                {
-                    resp.headers_mut().insert(MOLE_SESSION_HEADER, hv);
+                if let Some(value) = session_header {
+                    resp.headers_mut().insert(MOLE_SESSION_HEADER, value);
                 }
-                let _ = apply_mole_credential_headers(resp.headers_mut(), &mole_credential);
+                overwrite_headers(resp.headers_mut(), &credential_headers);
                 resp
             }
         };
@@ -342,7 +389,13 @@ async fn forward_to_upstream(
     );
 
     let mut out_headers = HeaderMap::new();
-    copy_filtered_headers(&parts.headers, &mut out_headers, strip_authorization, true);
+    copy_filtered_headers(
+        &parts.headers,
+        &mut out_headers,
+        HeaderDirection::ToUpstream {
+            strip_authorization,
+        },
+    );
 
     let Ok(mut upstream_resp) = app
         .http_client
@@ -357,7 +410,11 @@ async fn forward_to_upstream(
 
     let status = upstream_resp.status();
     let mut resp_headers = HeaderMap::new();
-    copy_filtered_headers(upstream_resp.headers(), &mut resp_headers, false, false);
+    copy_filtered_headers(
+        upstream_resp.headers(),
+        &mut resp_headers,
+        HeaderDirection::ToClient,
+    );
     let Ok(resp_body) =
         read_upstream_body_limited(&mut upstream_resp, MAX_PROXY_RESPONSE_BODY_BYTES).await
     else {
@@ -395,49 +452,6 @@ async fn read_upstream_body_limited(
     Ok(Bytes::from(body))
 }
 
-fn copy_filtered_headers(
-    src: &HeaderMap,
-    dst: &mut HeaderMap,
-    strip_authorization: bool,
-    strip_host: bool,
-) {
-    let connection_nominated = connection_nominated_headers(src);
-
-    for (name, val) in src {
-        if name == MOLE_SESSION_HEADER
-            || name == MOLE_CREDENTIAL_HEADER
-            || is_hop_by_hop_header(name)
-            || connection_nominated.contains(name.as_str())
-            || (strip_authorization && name == AUTHORIZATION)
-            || (strip_host && name == HOST)
-            || (strip_host && is_untrusted_forwarding_header(name))
-            || (!strip_host
-                && name == WWW_AUTHENTICATE
-                && val
-                    .to_str()
-                    .is_ok_and(|value| !parse_www_authenticate_str(value).is_empty()))
-        {
-            continue;
-        }
-        dst.append(name.clone(), val.clone());
-    }
-}
-
-fn is_untrusted_forwarding_header(name: &HeaderName) -> bool {
-    matches!(
-        name.as_str(),
-        "cf-connecting-ip"
-            | "forwarded"
-            | "proxy"
-            | "true-client-ip"
-            | "x-forwarded-for"
-            | "x-forwarded-host"
-            | "x-forwarded-port"
-            | "x-forwarded-proto"
-            | "x-real-ip"
-    )
-}
-
 fn validate_upstream_origin(origin: &Url) -> anyhow::Result<()> {
     anyhow::ensure!(
         matches!(origin.scheme(), "http" | "https") && origin.has_host(),
@@ -454,114 +468,6 @@ fn validate_upstream_origin(origin: &Url) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn is_hop_by_hop_header(name: &HeaderName) -> bool {
-    name == CONNECTION
-        || name == CONTENT_LENGTH
-        || name == TRANSFER_ENCODING
-        || name == UPGRADE
-        || matches!(
-            name.as_str(),
-            "keep-alive"
-                | "proxy-authenticate"
-                | "proxy-authorization"
-                | "proxy-connection"
-                | "te"
-                | "trailer"
-                | "trailers"
-        )
-}
-
-fn connection_nominated_headers(headers: &HeaderMap) -> BTreeSet<String> {
-    let mut nominated = BTreeSet::new();
-    for value in headers.get_all(CONNECTION) {
-        let Ok(value) = value.to_str() else {
-            continue;
-        };
-        for token in value
-            .split(',')
-            .map(str::trim)
-            .filter(|token| !token.is_empty())
-        {
-            if let Ok(name) = HeaderName::from_bytes(token.as_bytes()) {
-                nominated.insert(name.as_str().to_owned());
-            }
-        }
-    }
-    nominated
-}
-
-/// Computes the canonical digest bound into a protected request's EC-ACT challenge.
-///
-/// MOLE transport headers and hop-by-hop framing fields are excluded because they
-/// necessarily differ between the unauthenticated request and its presentation retry.
-/// All other end-to-end fields, including cookies, plus the complete body are bound.
-pub fn compute_request_binding(
-    method: &Method,
-    path_and_query: &str,
-    headers: &HeaderMap,
-    body: &[u8],
-) -> [u8; 32] {
-    let mut excluded: BTreeSet<String> = [
-        "authorization",
-        "cf-connecting-ip",
-        "connection",
-        "content-length",
-        "forwarded",
-        "host",
-        "keep-alive",
-        "mole-credential",
-        "mole-session",
-        "proxy-authenticate",
-        "proxy-authorization",
-        "proxy-connection",
-        "proxy",
-        "te",
-        "trailer",
-        "trailers",
-        "transfer-encoding",
-        "upgrade",
-        "true-client-ip",
-        "x-forwarded-for",
-        "x-forwarded-host",
-        "x-forwarded-port",
-        "x-forwarded-proto",
-        "x-real-ip",
-    ]
-    .into_iter()
-    .map(str::to_owned)
-    .collect();
-    excluded.extend(connection_nominated_headers(headers));
-
-    let mut fields = Vec::new();
-    let included_names: BTreeSet<&str> = headers
-        .keys()
-        .map(HeaderName::as_str)
-        .filter(|name| !excluded.contains(*name))
-        .collect();
-    for name in included_names {
-        for value in headers.get_all(name) {
-            fields.push((name.as_bytes().to_vec(), value.as_bytes().to_vec()));
-        }
-    }
-
-    let mut hash = Sha256::new();
-    hash_request_field(&mut hash, b"MOLE-PROTECTED-REQUEST-v1");
-    hash_request_field(&mut hash, method.as_str().as_bytes());
-    hash_request_field(&mut hash, path_and_query.as_bytes());
-    hash.update((fields.len() as u64).to_be_bytes());
-    for (name, value) in fields {
-        hash_request_field(&mut hash, &name);
-        hash_request_field(&mut hash, &value);
-    }
-    hash_request_field(&mut hash, body);
-    hash.finalize().into()
-}
-
-fn hash_request_field(hash: &mut Sha256, value: &[u8]) {
-    hash.update((value.len() as u64).to_be_bytes());
-    hash.update(value);
-}
-
 fn challenge_401_response(app: &ModeratorProxyApp, request_binding: &[u8; 32]) -> Response {
     let act_chal = app.store.issue_ec_act_challenge(
         &app.config.public_origin,
@@ -572,10 +478,20 @@ fn challenge_401_response(app: &ModeratorProxyApp, request_binding: &[u8; 32]) -
         .store
         .issue_redemption_challenge(&app.config.public_origin, &app.config.policy);
 
+    let act_challenge = match act_chal.to_bytes() {
+        Ok(challenge) => challenge,
+        Err(error) => {
+            tracing::error!(%error, "failed to encode EC-ACT challenge");
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to encode authentication challenge",
+            );
+        }
+    };
     let mut challenges = vec![
         MoleChallenge::Credential {
             credential_type: CredentialType::EC_ACT,
-            challenge: act_chal.to_bytes().unwrap_or_default(),
+            challenge: act_challenge,
         },
         MoleChallenge::Redeem {
             endorsement_type: EndorsementType::EC_IHAT,
@@ -589,7 +505,16 @@ fn challenge_401_response(app: &ModeratorProxyApp, request_binding: &[u8; 32]) -
         });
     }
 
-    let www_auth = format_www_authenticate(&challenges).unwrap_or_default();
+    let www_auth = match format_www_authenticate(&challenges) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::error!(%error, "failed to encode WWW-Authenticate challenge");
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to encode authentication challenge",
+            );
+        }
+    };
     let mut resp = (
         StatusCode::UNAUTHORIZED,
         [
@@ -607,7 +532,8 @@ fn challenge_401_response(app: &ModeratorProxyApp, request_binding: &[u8; 32]) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use http::header::COOKIE;
+    use http::header::{AUTHORIZATION, CONNECTION, COOKIE, HeaderName};
+    use prototalpid_http::transport::MOLE_CREDENTIAL_HEADER;
 
     #[test]
     fn request_binding_covers_body_and_cookie() {
@@ -662,7 +588,13 @@ mod tests {
         );
 
         let mut forwarded = HeaderMap::new();
-        copy_filtered_headers(&second, &mut forwarded, false, true);
+        copy_filtered_headers(
+            &second,
+            &mut forwarded,
+            HeaderDirection::ToUpstream {
+                strip_authorization: false,
+            },
+        );
         assert!(forwarded.get(CONNECTION).is_none());
         assert!(forwarded.get(COOKIE).is_none());
         assert!(forwarded.get(&removable).is_none());
@@ -683,6 +615,26 @@ mod tests {
         assert_ne!(
             compute_request_binding(&Method::GET, "/protected", &first, &[]),
             compute_request_binding(&Method::GET, "/protected", &reversed, &[]),
+        );
+    }
+
+    #[test]
+    fn request_binding_v1_encoding_is_stable() {
+        let repeated = HeaderName::from_static("x-repeated");
+        let mut headers = HeaderMap::new();
+        headers.insert(COOKIE, HeaderValue::from_static("account=alice"));
+        headers.append(&repeated, HeaderValue::from_static("first"));
+        headers.append(&repeated, HeaderValue::from_static("last"));
+        headers.insert(CONNECTION, HeaderValue::from_static("X-Ignored"));
+        headers.insert("x-ignored", HeaderValue::from_static("not-bound"));
+
+        assert_eq!(
+            compute_request_binding(&Method::POST, "/transfer?confirm=1", &headers, b"amount=1",),
+            [
+                0x36, 0x90, 0x4f, 0x9c, 0x19, 0x7c, 0x31, 0xdf, 0xb1, 0xe9, 0xa5, 0xe2, 0xb7, 0x98,
+                0xf2, 0xef, 0x6c, 0xb1, 0x29, 0x8a, 0xee, 0xc7, 0x6d, 0x79, 0x1b, 0xc5, 0x0b, 0x20,
+                0x54, 0xcd, 0xe4, 0xa8,
+            ],
         );
     }
 
@@ -708,7 +660,7 @@ mod tests {
         upstream.insert("set-cookie", HeaderValue::from_static("origin=ok; Secure"));
 
         let mut client_response = HeaderMap::new();
-        copy_filtered_headers(&upstream, &mut client_response, false, false);
+        copy_filtered_headers(&upstream, &mut client_response, HeaderDirection::ToClient);
         assert!(client_response.get(MOLE_CREDENTIAL_HEADER).is_none());
         assert!(client_response.get(MOLE_SESSION_HEADER).is_none());
         assert_eq!(
@@ -726,14 +678,34 @@ mod tests {
 
     #[test]
     fn client_cannot_spoof_forwarding_identity_headers() {
+        let clean_binding = compute_request_binding(
+            &Method::GET,
+            "/protected",
+            &HeaderMap::from_iter([(
+                HeaderName::from_static("x-application"),
+                HeaderValue::from_static("retained"),
+            )]),
+            &[],
+        );
         let mut client_request = HeaderMap::new();
         client_request.insert("forwarded", HeaderValue::from_static("for=192.0.2.1"));
         client_request.insert("x-forwarded-for", HeaderValue::from_static("192.0.2.1"));
         client_request.insert("x-real-ip", HeaderValue::from_static("192.0.2.1"));
         client_request.insert("x-application", HeaderValue::from_static("retained"));
 
+        assert_eq!(
+            clean_binding,
+            compute_request_binding(&Method::GET, "/protected", &client_request, &[]),
+        );
+
         let mut upstream_request = HeaderMap::new();
-        copy_filtered_headers(&client_request, &mut upstream_request, false, true);
+        copy_filtered_headers(
+            &client_request,
+            &mut upstream_request,
+            HeaderDirection::ToUpstream {
+                strip_authorization: false,
+            },
+        );
         assert!(upstream_request.get("forwarded").is_none());
         assert!(upstream_request.get("x-forwarded-for").is_none());
         assert!(upstream_request.get("x-real-ip").is_none());

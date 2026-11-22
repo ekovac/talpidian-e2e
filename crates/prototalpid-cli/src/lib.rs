@@ -5,6 +5,6 @@ pub mod store;
 
 pub use client::{HttpResponseData, MoleClient, MoleClientOptions};
 pub use store::{
-    CredentialSummary, EndorsementSummary, PendingSpendRecord, PendingSpendSummary, StoreStatus,
-    WalletStore, default_store_path, normalize_origin_input,
+    CredentialSummary, EndorsementSummary, PendingSpendRecord, PendingSpendState,
+    PendingSpendSummary, StoreStatus, WalletStore, default_store_path, normalize_origin_input,
 };
